@@ -9,6 +9,21 @@
 #   - telemetry.YOUR_DOMAIN
 
 services:
+  # Kvrocks - Redis-compatible key-value store with RocksDB persistence
+  # Handles sessions, user data, and server-player mappings
+  kvrocks:
+    image: apache/kvrocks:latest
+    user: root
+    command: --bind 0.0.0.0 --dir /data
+    volumes:
+      - ./kvrocks-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6666", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # Traefik reverse proxy for HTTPS
   traefik:
     image: traefik:v3.2
@@ -40,6 +55,9 @@ services:
       PORT: "3000"
       DATA_DIR: "/app/data"
       ASSETS_PATH: "/app/assets/Assets.zip"
+      # Redis/Kvrocks connection (Kvrocks default port is 6666)
+      REDIS_URL: "redis://kvrocks:6666"
+      ADMIN_PASSWORD: "changeme"
     volumes:
       - ./data:/app/data
       - ./assets:/app/assets
@@ -61,4 +79,7 @@ services:
       - "traefik.http.services.hytale-auth.loadbalancer.server.port=3000"
     restart: unless-stopped
     depends_on:
-      - traefik
+      kvrocks:
+        condition: service_healthy
+      traefik:
+        condition: service_started

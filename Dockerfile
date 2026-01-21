@@ -8,6 +8,10 @@ RUN apk add --no-cache unzip
 # Create directories
 RUN mkdir -p /app/data /app/assets
 
+# Copy package files and install dependencies
+COPY package*.json ./
+RUN npm ci --only=production
+
 # Copy server and static assets
 COPY server.js ./
 COPY assets/*.js ./assets/

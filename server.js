@@ -2,15 +2,61 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { execSync } = require('child_process');
+const Redis = require('ioredis');
 
 // Configuration via environment variables
 const PORT = process.env.PORT || 3000;
 const DOMAIN = process.env.DOMAIN || 'sanasol.ws';
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const ASSETS_PATH = process.env.ASSETS_PATH || '/app/assets/Assets.zip';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
-// File path for persisted user data
+// Admin session tokens (in-memory, reset on restart)
+const adminTokens = new Set();
+
+// Redis client with connection handling
+const redis = new Redis(REDIS_URL, {
+  retryDelayOnFailover: 100,
+  maxRetriesPerRequest: 3,
+  lazyConnect: true,
+});
+
+
+let redisConnected = false;
+
+redis.on('connect', () => {
+  console.log('Connected to Redis/Kvrocks');
+  redisConnected = true;
+});
+
+redis.on('error', (err) => {
+  console.error('Redis connection error:', err.message);
+  redisConnected = false;
+});
+
+redis.on('close', () => {
+  console.log('Redis connection closed');
+  redisConnected = false;
+});
+
+// Redis key prefixes
+const REDIS_KEYS = {
+  SESSION: 'session:',      // session:{token} -> session data
+  AUTH_GRANT: 'authgrant:', // authgrant:{grant} -> auth grant data
+  USER: 'user:',            // user:{uuid} -> user profile data
+  SERVER_PLAYERS: 'server:', // server:{audience} -> SET of player UUIDs
+  PLAYER_SERVER: 'player:', // player:{uuid} -> current server audience
+  USERNAME: 'username:',    // username:{uuid} -> username string
+  SERVER_NAME: 'servername:', // servername:{audience} -> server display name
+};
+
+// Session TTL in seconds (10 hours)
+const SESSION_TTL = 36000;
+
+// File path for persisted user data (fallback for migration)
 const USER_DATA_FILE = path.join(DATA_DIR, 'user_data.json');
 
 // Cache for cosmetics loaded from Assets.zip
@@ -26,7 +72,7 @@ let cachedGradientSets = null;
 let cachedEyeColors = null;
 
 // Ed25519 key pair for JWT signing - persisted to survive restarts
-const KEY_ID = '2025-10-01';
+const KEY_ID = '2025-10-01-sanasol';
 const KEY_FILE = path.join(DATA_DIR, 'jwt_keys.json');
 
 let privateKey, publicKey, publicKeyJwk;
@@ -81,38 +127,516 @@ function loadOrGenerateKeys() {
 
 loadOrGenerateKeys();
 
-// Load persisted user data
-function loadUserData() {
-  try {
-    if (fs.existsSync(USER_DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(USER_DATA_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.log('Notice: Could not load user data:', e.message);
-  }
-  return {};
-}
-
-// Save user data to disk
-function saveUserData(data) {
-  try {
-    // Ensure data directory exists
-    const dir = path.dirname(USER_DATA_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(USER_DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.log('Notice: Could not save user data:', e.message);
-  }
-}
-
-// In-memory cache, loaded from file on startup
-let userData = loadUserData();
-
-// Cache for UUID -> username mapping (to persist usernames across requests)
-// This ensures we always use the correct player name even when server tokens are involved
+// Local cache for usernames (reduces Redis roundtrips for frequent lookups)
 const uuidUsernameCache = new Map();
+
+// ============================================================================
+// REDIS STORAGE LAYER - All persistence handled via Redis/Kvrocks
+// ============================================================================
+
+// Initialize Redis connection and migrate old data if needed
+async function initializeRedis() {
+  try {
+    await redis.connect();
+    console.log('Redis client connected');
+
+    // Migrate old file-based data to Redis if it exists
+    await migrateFileDataToRedis();
+
+    // Rebuild server mappings from existing sessions
+    await rebuildServerMappings();
+  } catch (e) {
+    console.error('Failed to connect to Redis:', e.message);
+    console.log('Server will continue but data will not persist!');
+  }
+}
+
+// Rebuild server:* keys from existing sessions on startup
+// This ensures server player counts are accurate after restart
+async function rebuildServerMappings() {
+  if (!redisConnected) return;
+
+  try {
+    console.log('Rebuilding server mappings from sessions...');
+
+    // Clear all existing server:* keys (they may be stale)
+    const oldServerKeys = await redis.keys(`${REDIS_KEYS.SERVER_PLAYERS}*`);
+    if (oldServerKeys.length > 0) {
+      for (const key of oldServerKeys) {
+        await redis.del(key);
+      }
+      console.log(`Cleared ${oldServerKeys.length} stale server keys`);
+    }
+
+    // Rebuild from valid sessions
+    const sessionKeys = await redis.keys(`${REDIS_KEYS.SESSION}*`);
+    let rebuiltCount = 0;
+    const serverCounts = new Map();
+
+    for (const key of sessionKeys) {
+      const sessionJson = await redis.get(key);
+      if (!sessionJson) continue;
+
+      try {
+        const session = JSON.parse(sessionJson);
+        if (session.serverAudience && session.uuid) {
+          await redis.sadd(`${REDIS_KEYS.SERVER_PLAYERS}${session.serverAudience}`, session.uuid);
+
+          // Get remaining TTL from session and apply to player mapping
+          const ttl = await redis.ttl(key);
+          if (ttl > 0) {
+            await redis.setex(`${REDIS_KEYS.PLAYER_SERVER}${session.uuid}`, ttl, session.serverAudience);
+          }
+
+          rebuiltCount++;
+          serverCounts.set(session.serverAudience, (serverCounts.get(session.serverAudience) || 0) + 1);
+        }
+      } catch (e) {
+        // Skip invalid session
+      }
+    }
+
+    console.log(`Rebuilt ${rebuiltCount} player-server mappings across ${serverCounts.size} servers`);
+  } catch (e) {
+    console.error('Failed to rebuild server mappings:', e.message);
+  }
+}
+
+// Migrate old file-based data to Redis (one-time migration)
+async function migrateFileDataToRedis() {
+  if (!redisConnected) return;
+
+  // Check if migration already done
+  const migrated = await redis.get('migration:completed');
+  if (migrated) return;
+
+  console.log('Checking for data to migrate to Redis...');
+
+  // Migrate user data
+  if (fs.existsSync(USER_DATA_FILE)) {
+    try {
+      const fileData = JSON.parse(fs.readFileSync(USER_DATA_FILE, 'utf8'));
+      let count = 0;
+      for (const [uuid, data] of Object.entries(fileData)) {
+        await redis.set(`${REDIS_KEYS.USER}${uuid}`, JSON.stringify(data));
+        if (data.username) {
+          await redis.set(`${REDIS_KEYS.USERNAME}${uuid}`, data.username);
+        }
+        count++;
+      }
+      console.log(`Migrated ${count} user records to Redis`);
+    } catch (e) {
+      console.log('Could not migrate user data:', e.message);
+    }
+  }
+
+  // Migrate sessions file
+  const sessionsFile = path.join(DATA_DIR, 'active_sessions.json');
+  if (fs.existsSync(sessionsFile)) {
+    try {
+      const fileData = JSON.parse(fs.readFileSync(sessionsFile, 'utf8'));
+      const now = Date.now();
+      let sessionCount = 0;
+      let grantCount = 0;
+
+      if (fileData.sessions) {
+        for (const [token, session] of Object.entries(fileData.sessions)) {
+          const expiresAt = new Date(session.expiresAt).getTime();
+          const ttl = Math.max(1, Math.floor((expiresAt - now) / 1000));
+          if (ttl > 0) {
+            await redis.setex(`${REDIS_KEYS.SESSION}${token}`, ttl, JSON.stringify(session));
+            if (session.serverAudience && session.uuid) {
+              await redis.sadd(`${REDIS_KEYS.SERVER_PLAYERS}${session.serverAudience}`, session.uuid);
+              await redis.setex(`${REDIS_KEYS.PLAYER_SERVER}${session.uuid}`, ttl, session.serverAudience);
+            }
+            sessionCount++;
+          }
+        }
+      }
+
+      if (fileData.authGrants) {
+        for (const [grant, info] of Object.entries(fileData.authGrants)) {
+          const expiresAt = new Date(info.expiresAt).getTime();
+          const ttl = Math.max(1, Math.floor((expiresAt - now) / 1000));
+          if (ttl > 0) {
+            await redis.setex(`${REDIS_KEYS.AUTH_GRANT}${grant}`, ttl, JSON.stringify(info));
+            grantCount++;
+          }
+        }
+      }
+
+      console.log(`Migrated ${sessionCount} sessions and ${grantCount} auth grants to Redis`);
+    } catch (e) {
+      console.log('Could not migrate sessions:', e.message);
+    }
+  }
+
+  await redis.set('migration:completed', new Date().toISOString());
+  console.log('Redis migration completed');
+}
+
+// Register a new game session
+async function registerSession(sessionToken, uuid, username, serverAudience = null) {
+  const sessionData = {
+    uuid,
+    username,
+    serverAudience,
+    createdAt: new Date().toISOString()
+  };
+
+  if (redisConnected) {
+    try {
+      // Store session with TTL
+      await redis.setex(`${REDIS_KEYS.SESSION}${sessionToken}`, SESSION_TTL, JSON.stringify(sessionData));
+
+      // Track player-server association if we know the server
+      if (serverAudience) {
+        await redis.sadd(`${REDIS_KEYS.SERVER_PLAYERS}${serverAudience}`, uuid);
+        await redis.setex(`${REDIS_KEYS.PLAYER_SERVER}${uuid}`, SESSION_TTL, serverAudience);
+      }
+
+      // Update username cache
+      if (username && username !== 'Player') {
+        await redis.set(`${REDIS_KEYS.USERNAME}${uuid}`, username);
+        uuidUsernameCache.set(uuid, username);
+      }
+
+      console.log(`Session registered: ${uuid} (${username}) on server ${serverAudience || 'unknown'}`);
+    } catch (e) {
+      console.error('Failed to register session in Redis:', e.message);
+    }
+  }
+}
+
+// Register an auth grant (player joining a server)
+async function registerAuthGrant(authGrant, playerUuid, playerName, serverAudience) {
+  const grantData = {
+    playerUuid,
+    playerName,
+    serverAudience,
+    createdAt: new Date().toISOString()
+  };
+
+  if (redisConnected) {
+    try {
+      // Store auth grant with TTL
+      await redis.setex(`${REDIS_KEYS.AUTH_GRANT}${authGrant}`, SESSION_TTL, JSON.stringify(grantData));
+
+      // Track player-server association
+      await redis.sadd(`${REDIS_KEYS.SERVER_PLAYERS}${serverAudience}`, playerUuid);
+      await redis.setex(`${REDIS_KEYS.PLAYER_SERVER}${playerUuid}`, SESSION_TTL, serverAudience);
+
+      // Update username
+      await persistUsername(playerUuid, playerName);
+
+      console.log(`Auth grant registered: ${playerUuid} (${playerName}) -> server ${serverAudience}`);
+    } catch (e) {
+      console.error('Failed to register auth grant in Redis:', e.message);
+    }
+  }
+}
+
+// Remove a session (player disconnected or session expired)
+async function removeSession(sessionToken) {
+  if (!redisConnected) return false;
+
+  try {
+    const sessionJson = await redis.get(`${REDIS_KEYS.SESSION}${sessionToken}`);
+    if (!sessionJson) return false;
+
+    const session = JSON.parse(sessionJson);
+
+    // Remove from server-player mapping
+    if (session.serverAudience) {
+      await redis.srem(`${REDIS_KEYS.SERVER_PLAYERS}${session.serverAudience}`, session.uuid);
+
+      // Check if server is now empty
+      const remaining = await redis.scard(`${REDIS_KEYS.SERVER_PLAYERS}${session.serverAudience}`);
+      if (remaining === 0) {
+        await redis.del(`${REDIS_KEYS.SERVER_PLAYERS}${session.serverAudience}`);
+      }
+    }
+
+    // Remove player-server mapping
+    await redis.del(`${REDIS_KEYS.PLAYER_SERVER}${session.uuid}`);
+
+    // Remove session
+    await redis.del(`${REDIS_KEYS.SESSION}${sessionToken}`);
+
+    console.log(`Session removed: ${session.uuid} (${session.username})`);
+    return true;
+  } catch (e) {
+    console.error('Failed to remove session:', e.message);
+    return false;
+  }
+}
+
+// Get players on a specific server
+async function getPlayersOnServer(serverAudience) {
+  if (!redisConnected) return [];
+
+  try {
+    const playerUuids = await redis.smembers(`${REDIS_KEYS.SERVER_PLAYERS}${serverAudience}`);
+    if (!playerUuids || playerUuids.length === 0) return [];
+
+    const players = [];
+    for (const uuid of playerUuids) {
+      let username = uuidUsernameCache.get(uuid);
+      if (!username) {
+        username = await redis.get(`${REDIS_KEYS.USERNAME}${uuid}`);
+        if (username) {
+          uuidUsernameCache.set(uuid, username);
+        }
+      }
+      players.push({
+        uuid,
+        username: username || `Player_${uuid.substring(0, 8)}`
+      });
+    }
+    return players;
+  } catch (e) {
+    console.error('Failed to get players on server:', e.message);
+    return [];
+  }
+}
+
+// Find player by username on a specific server
+async function findPlayerOnServer(serverAudience, username) {
+  const players = await getPlayersOnServer(serverAudience);
+  return players.filter(p => p.username.toLowerCase() === username.toLowerCase());
+}
+
+// Extract server audience from bearer token in headers
+function extractServerAudienceFromHeaders(headers) {
+  if (!headers || !headers.authorization) return null;
+
+  try {
+    const token = headers.authorization.replace('Bearer ', '');
+    const parts = token.split('.');
+    if (parts.length >= 2) {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+      if (payload.aud) {
+        return payload.aud;
+      }
+      if (payload.scope === 'hytale:server' && payload.sub) {
+        return payload.sub;
+      }
+    }
+  } catch (e) {
+    // Silent fail - token parsing is optional
+  }
+  return null;
+}
+
+// Get all active sessions (for admin API)
+async function getAllActiveSessions() {
+  if (!redisConnected) return { sessions: [], servers: [] };
+
+  try {
+    // Get all session keys
+    const sessionKeys = await redis.keys(`${REDIS_KEYS.SESSION}*`);
+    const sessions = [];
+    const playerTtls = new Map(); // uuid -> ttl in seconds
+
+    for (const key of sessionKeys) {
+      const sessionJson = await redis.get(key);
+      if (sessionJson) {
+        const session = JSON.parse(sessionJson);
+        session.token = key.replace(REDIS_KEYS.SESSION, '').substring(0, 8) + '...';
+
+        // Get TTL for this session
+        const ttl = await redis.ttl(key);
+        session.ttl = ttl;
+        session.ttlMinutes = Math.round(ttl / 60);
+        session.ttlHours = Math.round(ttl / 3600 * 10) / 10;
+
+        // Track highest TTL per player (in case of multiple sessions)
+        if (!playerTtls.has(session.uuid) || ttl > playerTtls.get(session.uuid)) {
+          playerTtls.set(session.uuid, ttl);
+        }
+
+        sessions.push(session);
+      }
+    }
+
+    // Build a set of UUIDs that have valid sessions
+    const validPlayerUuids = new Set(sessions.map(s => s.uuid));
+
+    // Get all server keys with player details
+    const serverKeys = await redis.keys(`${REDIS_KEYS.SERVER_PLAYERS}*`);
+    const servers = [];
+
+    for (const key of serverKeys) {
+      const serverAudience = key.replace(REDIS_KEYS.SERVER_PLAYERS, '');
+      const playerUuids = await redis.smembers(key);
+
+      // Filter to only players with valid sessions
+      const activePlayers = [];
+      const staleUuids = [];
+
+      for (const uuid of playerUuids) {
+        if (validPlayerUuids.has(uuid)) {
+          // Player has valid session
+          let username = uuidUsernameCache.get(uuid);
+          if (!username) {
+            username = await redis.get(`${REDIS_KEYS.USERNAME}${uuid}`);
+            if (username) {
+              uuidUsernameCache.set(uuid, username);
+            }
+          }
+          const ttl = playerTtls.get(uuid) || 0;
+          activePlayers.push({
+            uuid,
+            username: username || `Player_${uuid.substring(0, 8)}`,
+            ttl: ttl,
+            ttlMinutes: Math.round(ttl / 60),
+            ttlHours: Math.round(ttl / 3600 * 10) / 10
+          });
+        } else {
+          // Stale UUID - no valid session
+          staleUuids.push(uuid);
+        }
+      }
+
+      // Clean up stale UUIDs from server set
+      if (staleUuids.length > 0) {
+        for (const uuid of staleUuids) {
+          await redis.srem(key, uuid);
+        }
+        console.log(`Cleaned ${staleUuids.length} stale players from server ${serverAudience}`);
+      }
+
+      // If server has no active players, delete the server key entirely
+      if (activePlayers.length === 0) {
+        await redis.del(key);
+        console.log(`Removed empty server: ${serverAudience}`);
+        continue; // Don't add to servers list
+      }
+
+      // Get server display name
+      let serverName = await getServerName(serverAudience);
+
+      servers.push({
+        audience: serverAudience,
+        name: serverName,
+        playerCount: activePlayers.length,
+        players: activePlayers
+      });
+    }
+
+    // Sort servers by player count (descending)
+    servers.sort((a, b) => b.playerCount - a.playerCount);
+
+    return { sessions, servers };
+  } catch (e) {
+    console.error('Failed to get active sessions:', e.message);
+    return { sessions: [], servers: [] };
+  }
+}
+
+// Get server display name from Redis
+async function getServerName(audience) {
+  if (!audience || !redisConnected) return null;
+
+  try {
+    return await redis.get(`${REDIS_KEYS.SERVER_NAME}${audience}`);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Set server display name in Redis
+async function setServerName(audience, name) {
+  if (!audience || !name || !redisConnected) return false;
+
+  try {
+    await redis.set(`${REDIS_KEYS.SERVER_NAME}${audience}`, name);
+    console.log(`Server name set: ${audience} -> "${name}"`);
+    return true;
+  } catch (e) {
+    console.error('Failed to set server name:', e.message);
+    return false;
+  }
+}
+
+// Persist username to Redis
+async function persistUsername(uuid, name) {
+  if (!uuid || !name || name === 'Player') return;
+
+  // Update local cache
+  uuidUsernameCache.set(uuid, name);
+
+  if (redisConnected) {
+    try {
+      await redis.set(`${REDIS_KEYS.USERNAME}${uuid}`, name);
+
+      // Also update user data
+      const userKey = `${REDIS_KEYS.USER}${uuid}`;
+      let userData = {};
+      const existing = await redis.get(userKey);
+      if (existing) {
+        userData = JSON.parse(existing);
+      }
+      userData.username = name;
+      userData.lastSeen = new Date().toISOString();
+      await redis.set(userKey, JSON.stringify(userData));
+    } catch (e) {
+      console.error('Failed to persist username:', e.message);
+    }
+  }
+}
+
+// Get user data from Redis
+async function getUserData(uuid) {
+  if (!redisConnected) return userData[uuid] || {};
+
+  try {
+    const data = await redis.get(`${REDIS_KEYS.USER}${uuid}`);
+    return data ? JSON.parse(data) : {};
+  } catch (e) {
+    console.error('Failed to get user data:', e.message);
+    return {};
+  }
+}
+
+// Save user data to Redis
+async function saveUserData(uuid, data) {
+  if (!redisConnected) return;
+
+  try {
+    await redis.set(`${REDIS_KEYS.USER}${uuid}`, JSON.stringify(data));
+    if (data.username) {
+      await redis.set(`${REDIS_KEYS.USERNAME}${uuid}`, data.username);
+      uuidUsernameCache.set(uuid, data.username);
+    }
+  } catch (e) {
+    console.error('Failed to save user data:', e.message);
+  }
+}
+
+// Get username from cache or Redis
+async function getUsername(uuid) {
+  // Check local cache first
+  if (uuidUsernameCache.has(uuid)) {
+    return uuidUsernameCache.get(uuid);
+  }
+
+  if (redisConnected) {
+    try {
+      const username = await redis.get(`${REDIS_KEYS.USERNAME}${uuid}`);
+      if (username) {
+        uuidUsernameCache.set(uuid, username);
+        return username;
+      }
+    } catch (e) {
+      // Fall through to default
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
 
 // Load cosmetics from Assets.zip
 function loadCosmeticsFromAssets() {
@@ -499,23 +1023,25 @@ function routeRequest(req, res, url, body, headers) {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
         if (payload.sub) uuid = payload.sub;
         if (payload.scope) tokenScope = payload.scope;
-        
+
         // Extract name from token
         let tokenName = null;
         if (payload.username) tokenName = payload.username;
         else if (payload.name) tokenName = payload.name;
-        
+
         // Cache token name if it's valid and from a player token
-        if (uuid && tokenName && tokenName !== 'Player' && tokenScope && 
+        if (uuid && tokenName && tokenName !== 'Player' && tokenScope &&
             (tokenScope.includes('hytale:client') || tokenScope.includes('hytale:editor'))) {
           uuidUsernameCache.set(uuid, tokenName);
           console.log(`Cached username from token for UUID ${uuid}: ${tokenName}`);
           name = tokenName;
+          // Persist to storage
+          persistUsername(uuid, tokenName);
         }
       }
     } catch (e) {}
   }
-  
+
   // If we don't have a valid name yet, try the cache
   if (!name || name === 'Player') {
     const cachedName = uuidUsernameCache.get(uuid);
@@ -524,9 +1050,14 @@ function routeRequest(req, res, url, body, headers) {
       console.log(`Using cached username for UUID ${uuid}: ${name}`);
     }
   }
-  
+
   // Final fallback
   if (!name) name = 'Player';
+
+  // Persist valid username from body (e.g., from /game-session/new)
+  if (uuid && name && name !== 'Player') {
+    persistUsername(uuid, name);
+  }
 
   // Avatar viewer routes
   if (urlPath.startsWith('/avatar/')) {
@@ -681,8 +1212,77 @@ function routeRequest(req, res, url, body, headers) {
 
   // Game session delete (logout/cleanup)
   if (urlPath === '/game-session' && req.method === 'DELETE') {
-    res.writeHead(204);
-    res.end();
+    handleGameSessionDelete(req, res, headers);
+    return;
+  }
+
+  // Admin login endpoint (no auth required)
+  if (urlPath === '/admin/login' && req.method === 'POST') {
+    handleAdminLogin(req, res, body);
+    return;
+  }
+
+  // Admin verify endpoint (check if token is valid)
+  if (urlPath === '/admin/verify') {
+    const token = headers['x-admin-token'] || url.searchParams.get('token');
+    if (token && adminTokens.has(token)) {
+      sendJson(res, 200, { valid: true });
+    } else {
+      sendJson(res, 401, { valid: false });
+    }
+    return;
+  }
+
+  // Admin dashboard HTML page (no auth - login happens client-side)
+  if (urlPath === '/admin' || urlPath === '/admin/') {
+    handleAdminDashboard(req, res);
+    return;
+  }
+
+  // Protected admin API routes - require token
+  if (urlPath.startsWith('/admin/')) {
+    const token = headers['x-admin-token'];
+    if (!token || !adminTokens.has(token)) {
+      sendJson(res, 401, { error: 'Unauthorized. Please login at /admin' });
+      return;
+    }
+  }
+
+  // Active sessions API - list all servers and players
+  if (urlPath === '/admin/sessions' || urlPath === '/sessions/active') {
+    handleActiveSessions(req, res);
+    return;
+  }
+
+  // Admin stats API (lightweight summary)
+  if (urlPath === '/admin/stats') {
+    handleAdminStats(req, res);
+    return;
+  }
+
+  // Admin servers API (paginated server list with players)
+  if (urlPath.startsWith('/admin/servers')) {
+    handleAdminServers(req, res, url);
+    return;
+  }
+
+  // Server name registration - POST /admin/server-name
+  if (urlPath === '/admin/server-name' && method === 'POST') {
+    handleSetServerName(req, res, body);
+    return;
+  }
+
+  // Profile lookup by UUID - for ProfileServiceClient.getProfileByUuid()
+  if (urlPath.startsWith('/profile/uuid/')) {
+    const lookupUuid = urlPath.replace('/profile/uuid/', '');
+    handleProfileLookupByUuid(req, res, lookupUuid, headers);
+    return;
+  }
+
+  // Profile lookup by username - for ProfileServiceClient.getProfileByUsername()
+  if (urlPath.startsWith('/profile/username/')) {
+    const lookupUsername = decodeURIComponent(urlPath.replace('/profile/username/', ''));
+    handleProfileLookupByUsername(req, res, lookupUsername, headers);
     return;
   }
 
@@ -762,6 +1362,9 @@ function handleAuthorizationGrant(req, res, body, uuid, name, headers) {
   const authGrant = generateAuthorizationGrant(uuid, name, audience);
   const expiresAt = new Date(Date.now() + 36000 * 1000).toISOString();
 
+  // Track this auth grant - player is joining this server
+  registerAuthGrant(authGrant, uuid, name, audience);
+
   sendJson(res, 200, {
     authorizationGrant: authGrant,
     expiresAt: expiresAt
@@ -822,6 +1425,9 @@ function handleTokenExchange(req, res, body, uuid, name, headers) {
   const refreshToken = generateSessionToken(uuid);
   const expiresAt = new Date(Date.now() + 36000 * 1000).toISOString();
 
+  // Register session with server audience so it persists across restarts
+  registerSession(accessToken, uuid, name, audience);
+
   sendJson(res, 200, {
     accessToken: accessToken,
     tokenType: 'Bearer',
@@ -843,6 +1449,9 @@ function handleGameSessionNew(req, res, body, uuid, name) {
   const sessionToken = generateSessionToken(uuid);
   const expiresAt = new Date(Date.now() + 36000 * 1000).toISOString();
 
+  // Register the session (server audience not known at this point)
+  registerSession(sessionToken, uuid, name, null);
+
   sendJson(res, 200, {
     sessionToken: sessionToken,
     identityToken: identityToken,
@@ -854,11 +1463,25 @@ function handleGameSessionNew(req, res, body, uuid, name) {
 function handleGameSessionRefresh(req, res, body, uuid, name, headers) {
   console.log('game-session/refresh:', uuid, name);
 
-  // Extract info from existing session token if provided
+  let oldSessionToken = null;
+
+  // Extract info from existing session token if provided in body
   if (body.sessionToken) {
+    oldSessionToken = body.sessionToken;
+  }
+
+  // Or from Authorization header
+  if (headers && headers.authorization) {
+    const token = headers.authorization.replace('Bearer ', '');
+    if (token.includes('.')) {
+      oldSessionToken = token;
+    }
+  }
+
+  // Parse old session token
+  if (oldSessionToken) {
     try {
-      const token = body.sessionToken;
-      const parts = token.split('.');
+      const parts = oldSessionToken.split('.');
       if (parts.length >= 2) {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
         if (payload.sub) uuid = payload.sub;
@@ -867,11 +1490,20 @@ function handleGameSessionRefresh(req, res, body, uuid, name, headers) {
     } catch (e) {
       console.log('Failed to parse session token:', e.message);
     }
+
+    // Remove old session
+    removeSession(oldSessionToken);
   }
 
   const identityToken = generateIdentityToken(uuid, name);
   const sessionToken = generateSessionToken(uuid);
   const expiresAt = new Date(Date.now() + 36000 * 1000).toISOString();
+
+  // Get server from old session or player mapping
+  const serverAudience = playerServer.get(uuid) || null;
+
+  // Register new session
+  registerSession(sessionToken, uuid, name, serverAudience);
 
   sendJson(res, 200, {
     sessionToken: sessionToken,
@@ -906,6 +1538,909 @@ function handleGameSessionChild(req, res, body, uuid, name) {
     identityToken: childIdentityToken,
     expiresAt: expiresAt
   });
+}
+
+// Handle game session delete (player disconnect/logout)
+function handleGameSessionDelete(req, res, headers) {
+  console.log('game-session DELETE request');
+
+  let sessionToken = null;
+
+  // Get session token from Authorization header
+  if (headers && headers.authorization) {
+    sessionToken = headers.authorization.replace('Bearer ', '');
+  }
+
+  if (sessionToken) {
+    const removed = removeSession(sessionToken);
+    console.log(`Session delete: ${removed ? 'removed' : 'not found'}`);
+  }
+
+  res.writeHead(204);
+  res.end();
+}
+
+// Active sessions API - returns all servers and their players
+async function handleActiveSessions(req, res) {
+  const { sessions, servers } = await getAllActiveSessions();
+
+  // Count unique players
+  const uniquePlayers = new Set(sessions.map(s => s.uuid));
+
+  sendJson(res, 200, {
+    servers,
+    sessions: sessions.length,
+    totalServers: servers.length,
+    totalPlayers: uniquePlayers.size,
+    timestamp: new Date().toISOString()
+  });
+}
+
+// Set server name - POST /admin/server-name
+async function handleSetServerName(req, res, body) {
+  const { audience, name } = body;
+
+  if (!audience) {
+    sendJson(res, 400, { error: 'Missing audience (server ID)' });
+    return;
+  }
+
+  if (!name) {
+    sendJson(res, 400, { error: 'Missing server name' });
+    return;
+  }
+
+  const success = await setServerName(audience, name);
+
+  if (success) {
+    sendJson(res, 200, { success: true, audience, name });
+  } else {
+    sendJson(res, 500, { error: 'Failed to set server name' });
+  }
+}
+
+// Admin stats API - detailed statistics
+// Lightweight admin stats - just counts, no player lists
+async function handleAdminStats(req, res) {
+  let keyCounts = { sessions: 0, authGrants: 0, users: 0, servers: 0 };
+  let redisInfo = { connected: false };
+
+  if (redisConnected) {
+    try {
+      // Use SCAN with COUNT for efficient counting on large datasets
+      const sessionKeys = await redis.keys(`${REDIS_KEYS.SESSION}*`);
+      const authGrantKeys = await redis.keys(`${REDIS_KEYS.AUTH_GRANT}*`);
+      const userKeys = await redis.keys(`${REDIS_KEYS.USER}*`);
+      const serverKeys = await redis.keys(`${REDIS_KEYS.SERVER_PLAYERS}*`);
+
+      keyCounts = {
+        sessions: sessionKeys.length,
+        authGrants: authGrantKeys.length,
+        users: userKeys.length,
+        servers: serverKeys.length
+      };
+
+      // Get unique player count from sessions
+      const uniquePlayers = new Set();
+      for (const key of sessionKeys) {
+        const sessionJson = await redis.get(key);
+        if (sessionJson) {
+          try {
+            const session = JSON.parse(sessionJson);
+            if (session.uuid) uniquePlayers.add(session.uuid);
+          } catch (e) {}
+        }
+      }
+      keyCounts.activePlayers = uniquePlayers.size;
+
+      redisInfo = { connected: true };
+    } catch (e) {
+      redisInfo = { connected: true, error: e.message };
+    }
+  }
+
+  sendJson(res, 200, {
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    redis: redisInfo,
+    keys: keyCounts,
+    activeSessions: keyCounts.sessions,
+    activeServers: keyCounts.servers,
+    activePlayers: keyCounts.activePlayers || 0,
+    timestamp: new Date().toISOString()
+  }, req);
+}
+
+// Paginated server list with players - /admin/servers?page=1&limit=10
+// Optimized: sorts by player count, fetches details only for requested page
+async function handleAdminServers(req, res, url) {
+  const page = parseInt(url.searchParams.get('page')) || 1;
+  const limit = Math.min(parseInt(url.searchParams.get('limit')) || 10, 50); // Max 50 per page
+  const offset = (page - 1) * limit;
+
+  if (!redisConnected) {
+    sendJson(res, 200, {
+      servers: [],
+      pagination: { page, limit, totalServers: 0, totalPages: 0, hasNext: false, hasPrev: false },
+      timestamp: new Date().toISOString()
+    }, req);
+    return;
+  }
+
+  try {
+    // Step 1: Get all server keys using SCAN
+    const serverKeys = [];
+    let cursor = '0';
+    do {
+      const [newCursor, keys] = await redis.scan(cursor, 'MATCH', `${REDIS_KEYS.SERVER_PLAYERS}*`, 'COUNT', 500);
+      cursor = newCursor;
+      serverKeys.push(...keys);
+    } while (cursor !== '0');
+
+    // Step 2: Get player counts for all servers (SCARD is O(1), very fast)
+    const serverCounts = await Promise.all(serverKeys.map(async (key) => ({
+      key,
+      audience: key.replace(REDIS_KEYS.SERVER_PLAYERS, ''),
+      count: await redis.scard(key)
+    })));
+
+    // Step 3: Sort by player count descending (most active first)
+    serverCounts.sort((a, b) => b.count - a.count);
+
+    const totalServers = serverCounts.length;
+    const totalPages = Math.ceil(totalServers / limit);
+
+    // Step 4: Get only the servers for this page
+    const pageServers = serverCounts.slice(offset, offset + limit);
+
+    // Step 5: Fetch full details only for this page's servers (in parallel)
+    const servers = await Promise.all(pageServers.map(async ({ key, audience, count }) => {
+      // Get player UUIDs and server name in parallel
+      const [playerUuids, serverName] = await Promise.all([
+        redis.smembers(key),
+        redis.get(`${REDIS_KEYS.SERVER_NAME}${audience}`)
+      ]);
+
+      // Get usernames and TTLs for players (in parallel)
+      const players = await Promise.all(playerUuids.map(async (uuid) => {
+        // Get username and TTL in parallel
+        let username = uuidUsernameCache.get(uuid);
+
+        const [usernameFromRedis, ttl] = await Promise.all([
+          username ? Promise.resolve(null) : redis.get(`${REDIS_KEYS.USERNAME}${uuid}`),
+          redis.ttl(`${REDIS_KEYS.PLAYER_SERVER}${uuid}`) // player:{uuid} has TTL set
+        ]);
+
+        if (!username && usernameFromRedis) {
+          username = usernameFromRedis;
+          uuidUsernameCache.set(uuid, username);
+        }
+
+        return {
+          uuid,
+          username: username || `Player_${uuid.substring(0, 8)}`,
+          ttl: ttl > 0 ? ttl : 0
+        };
+      }));
+
+      return {
+        audience,
+        name: serverName,
+        playerCount: count,
+        players
+      };
+    }));
+
+    sendJson(res, 200, {
+      servers,
+      pagination: {
+        page,
+        limit,
+        totalServers,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1
+      },
+      timestamp: new Date().toISOString()
+    }, req);
+  } catch (e) {
+    console.error('handleAdminServers error:', e.message);
+    sendJson(res, 500, { error: 'Failed to fetch servers' }, req);
+  }
+}
+
+// Admin login - POST /admin/login
+function handleAdminLogin(req, res, body) {
+  const { password } = body;
+
+  if (!password) {
+    sendJson(res, 400, { error: 'Password required' });
+    return;
+  }
+
+  if (password !== ADMIN_PASSWORD) {
+    sendJson(res, 401, { error: 'Invalid password' });
+    return;
+  }
+
+  // Generate a random token
+  const token = crypto.randomBytes(32).toString('hex');
+  adminTokens.add(token);
+
+  // Clean up old tokens if too many (memory leak prevention)
+  if (adminTokens.size > 100) {
+    const tokensArray = Array.from(adminTokens);
+    for (let i = 0; i < 50; i++) {
+      adminTokens.delete(tokensArray[i]);
+    }
+  }
+
+  console.log(`Admin login successful, token: ${token.substring(0, 8)}...`);
+  sendJson(res, 200, { token });
+}
+
+// Admin dashboard HTML page
+function handleAdminDashboard(req, res) {
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hytale Auth Server - Admin Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    h1 {
+      text-align: center;
+      color: #00d4ff;
+      margin-bottom: 30px;
+      font-size: 2.5em;
+      text-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+    .stat-card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .stat-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    }
+    .stat-value {
+      font-size: 3em;
+      font-weight: bold;
+      color: #00d4ff;
+      text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
+    }
+    .stat-label { color: #888; margin-top: 5px; font-size: 0.9em; }
+    .section {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .section h2 {
+      color: #00d4ff;
+      margin-bottom: 15px;
+      font-size: 1.3em;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      padding-bottom: 10px;
+    }
+    .server-card {
+      background: rgba(0, 212, 255, 0.1);
+      border: 1px solid rgba(0, 212, 255, 0.2);
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+    .server-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .server-name {
+      font-weight: bold;
+      color: #00d4ff;
+      font-size: 1.1em;
+    }
+    .server-audience {
+      font-family: monospace;
+      font-size: 0.75em;
+      color: #888;
+      margin-top: 2px;
+      margin-bottom: 8px;
+    }
+    .player-count {
+      background: #00d4ff;
+      color: #1a1a2e;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-weight: bold;
+      font-size: 0.85em;
+    }
+    .players-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .player-tag {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 6px 12px;
+      border-radius: 15px;
+      font-size: 0.85em;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .player-tag .player-name {
+      color: #fff;
+      font-weight: 500;
+    }
+    .player-tag .uuid {
+      color: #666;
+      font-size: 0.7em;
+      font-family: monospace;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .status-dot.online { background: #00ff88; box-shadow: 0 0 10px #00ff88; }
+    .status-dot.offline { background: #ff4444; }
+    .ttl-badge {
+      font-size: 0.7em;
+      padding: 2px 6px;
+      border-radius: 10px;
+      margin-left: 5px;
+      font-weight: normal;
+    }
+    .ttl-fresh { background: rgba(0, 255, 136, 0.25); color: #7fdfb0; }
+    .ttl-warning { background: rgba(255, 170, 0, 0.25); color: #d4a852; }
+    .ttl-critical { background: rgba(255, 68, 68, 0.25); color: #e08080; }
+    .player-ttl {
+      font-size: 0.65em;
+      color: #888;
+      margin-top: 2px;
+    }
+    .server-ttl {
+      font-size: 0.8em;
+      margin-left: 10px;
+    }
+    .all-players-server {
+      background: rgba(138, 43, 226, 0.1);
+      border-color: rgba(138, 43, 226, 0.3);
+    }
+    .all-players-badge {
+      background: #8a2be2;
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.7em;
+      font-weight: bold;
+      margin-right: 8px;
+    }
+    .collapse-toggle {
+      color: #00d4ff;
+      cursor: pointer;
+      font-size: 0.85em;
+      padding: 5px 0;
+      margin-top: 5px;
+    }
+    .collapse-toggle:hover {
+      text-decoration: underline;
+    }
+    .players-list.collapsed {
+      display: none;
+    }
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 15px;
+      margin-top: 20px;
+      padding: 15px;
+    }
+    .pagination button {
+      background: rgba(0, 212, 255, 0.2);
+      border: 1px solid rgba(0, 212, 255, 0.3);
+      color: #00d4ff;
+      padding: 8px 16px;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .pagination button:hover:not(:disabled) {
+      background: rgba(0, 212, 255, 0.3);
+    }
+    .pagination button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .pagination span {
+      color: #888;
+      font-size: 0.9em;
+    }
+    .launcher-stat {
+      background: rgba(138, 43, 226, 0.1);
+      border-color: rgba(138, 43, 226, 0.3);
+    }
+    .launcher-stat .stat-value {
+      color: #b388ff;
+    }
+    .refresh-btn {
+      background: linear-gradient(135deg, #00d4ff, #0099cc);
+      border: none;
+      color: #fff;
+      padding: 12px 30px;
+      border-radius: 25px;
+      cursor: pointer;
+      font-size: 1em;
+      font-weight: bold;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .refresh-btn:hover {
+      transform: scale(1.05);
+      box-shadow: 0 5px 20px rgba(0, 212, 255, 0.4);
+    }
+    .refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .last-update { color: #666; font-size: 0.85em; margin-top: 10px; }
+    .no-data { color: #666; font-style: italic; padding: 20px; text-align: center; }
+    .redis-status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    /* Login styles */
+    .login-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.9);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+    }
+    .login-box {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border: 1px solid rgba(0, 212, 255, 0.3);
+      border-radius: 12px;
+      padding: 40px;
+      text-align: center;
+      max-width: 400px;
+      width: 90%;
+    }
+    .login-box h2 {
+      color: #00d4ff;
+      margin-bottom: 20px;
+    }
+    .login-box input {
+      width: 100%;
+      padding: 12px;
+      border-radius: 5px;
+      border: 1px solid #333;
+      background: #0d0d1a;
+      color: #fff;
+      margin-bottom: 15px;
+      font-size: 1em;
+    }
+    .login-box button {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #00d4ff, #0099cc);
+      border: none;
+      border-radius: 5px;
+      color: #fff;
+      font-size: 1em;
+      font-weight: bold;
+      cursor: pointer;
+      transition: transform 0.2s;
+    }
+    .login-box button:hover {
+      transform: scale(1.02);
+    }
+    .login-error {
+      color: #ff6b6b;
+      margin-top: 10px;
+      font-size: 0.9em;
+    }
+    .logout-btn {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: rgba(255, 100, 100, 0.2);
+      border: 1px solid rgba(255, 100, 100, 0.3);
+      color: #ff6b6b;
+      padding: 8px 16px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.85em;
+      z-index: 100;
+    }
+    .logout-btn:hover {
+      background: rgba(255, 100, 100, 0.3);
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <!-- Login Overlay -->
+  <div class="login-overlay" id="loginOverlay">
+    <div class="login-box">
+      <h2>Admin Login</h2>
+      <form id="loginForm">
+        <input type="password" id="loginPassword" placeholder="Enter admin password" autocomplete="current-password" required>
+        <button type="submit">Login</button>
+      </form>
+      <div class="login-error" id="loginError"></div>
+    </div>
+  </div>
+
+  <button class="logout-btn hidden" id="logoutBtn" onclick="logout()">Logout</button>
+
+  <div class="container hidden" id="mainContent">
+    <h1>Hytale Auth Server</h1>
+
+    <div class="stats-grid">
+      <div class="stat-card launcher-stat">
+        <div class="stat-value" id="launcherOnline">-</div>
+        <div class="stat-label">Launcher Online</div>
+      </div>
+      <div class="stat-card launcher-stat">
+        <div class="stat-value" id="launcherPeak">-</div>
+        <div class="stat-label">Launcher Peak</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="playerCount">-</div>
+        <div class="stat-label">Active Players</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="serverCount">-</div>
+        <div class="stat-label">Active Servers</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="sessionCount">-</div>
+        <div class="stat-label">Total Sessions</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="userCount">-</div>
+        <div class="stat-label">Registered Users</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2><span class="status-dot" id="redisStatus"></span>Redis Status</h2>
+      <div id="redisInfo">Loading...</div>
+    </div>
+
+    <div class="section">
+      <h2>Active Servers</h2>
+      <div id="serversList">Loading...</div>
+    </div>
+
+    <div class="section">
+      <h2>Set Server Name</h2>
+      <form id="serverNameForm" style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
+        <div style="flex: 1; min-width: 200px;">
+          <label style="display: block; margin-bottom: 5px; color: #888; font-size: 0.9em;">Server ID (audience)</label>
+          <input type="text" id="serverAudience" placeholder="e.g. abc123-..." style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #333; background: #1a1a2e; color: #fff;" required>
+        </div>
+        <div style="flex: 1; min-width: 150px;">
+          <label style="display: block; margin-bottom: 5px; color: #888; font-size: 0.9em;">Display Name</label>
+          <input type="text" id="serverDisplayName" placeholder="e.g. Main Server" style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #333; background: #1a1a2e; color: #fff;" required>
+        </div>
+        <button type="submit" class="refresh-btn" style="padding: 10px 20px;">Set Name</button>
+      </form>
+      <div id="serverNameResult" style="margin-top: 10px; font-size: 0.9em;"></div>
+    </div>
+
+    <div style="text-align: center; margin-top: 20px;">
+      <button class="refresh-btn" onclick="refreshData()">Refresh Data</button>
+      <div class="last-update">Last update: <span id="lastUpdate">-</span></div>
+    </div>
+  </div>
+
+  <script>
+    let currentPage = 1;
+    const pageLimit = 10;
+    let adminToken = localStorage.getItem('adminToken');
+
+    // Auth helper - adds token to fetch requests
+    async function authFetch(url, options = {}) {
+      if (!adminToken) throw new Error('Not authenticated');
+      options.headers = options.headers || {};
+      options.headers['X-Admin-Token'] = adminToken;
+      const res = await fetch(url, options);
+      if (res.status === 401) {
+        // Token invalid, force re-login
+        logout();
+        throw new Error('Session expired');
+      }
+      return res;
+    }
+
+    // Check if we're authenticated
+    async function checkAuth() {
+      if (!adminToken) return false;
+      try {
+        const res = await fetch('/admin/verify', {
+          headers: { 'X-Admin-Token': adminToken }
+        });
+        const data = await res.json();
+        return data.valid === true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    // Login handler
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const password = document.getElementById('loginPassword').value;
+      const errorDiv = document.getElementById('loginError');
+      errorDiv.textContent = '';
+
+      try {
+        const res = await fetch('/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.token) {
+          adminToken = data.token;
+          localStorage.setItem('adminToken', adminToken);
+          showDashboard();
+        } else {
+          errorDiv.textContent = data.error || 'Login failed';
+        }
+      } catch (e) {
+        errorDiv.textContent = 'Connection error';
+      }
+    });
+
+    // Logout handler
+    function logout() {
+      adminToken = null;
+      localStorage.removeItem('adminToken');
+      document.getElementById('loginOverlay').classList.remove('hidden');
+      document.getElementById('mainContent').classList.add('hidden');
+      document.getElementById('logoutBtn').classList.add('hidden');
+      document.getElementById('loginPassword').value = '';
+    }
+
+    // Show dashboard after login
+    function showDashboard() {
+      document.getElementById('loginOverlay').classList.add('hidden');
+      document.getElementById('mainContent').classList.remove('hidden');
+      document.getElementById('logoutBtn').classList.remove('hidden');
+      refreshData();
+    }
+
+    // Initialize - check auth on page load
+    (async () => {
+      if (await checkAuth()) {
+        showDashboard();
+      } else {
+        adminToken = null;
+        localStorage.removeItem('adminToken');
+      }
+    })();
+
+    // Helper function to get TTL status class and text
+    function getTtlStatus(ttlSeconds) {
+      const hours = ttlSeconds / 3600;
+      if (hours > 5) return { class: 'ttl-fresh', text: Math.round(hours) + 'h' };
+      if (hours > 1) return { class: 'ttl-warning', text: Math.round(hours * 10) / 10 + 'h' };
+      if (ttlSeconds > 60) return { class: 'ttl-critical', text: Math.round(ttlSeconds / 60) + 'm' };
+      return { class: 'ttl-critical', text: ttlSeconds + 's' };
+    }
+
+    async function refreshData() {
+      const btn = document.querySelector('.refresh-btn');
+      btn.disabled = true;
+      btn.textContent = 'Loading...';
+
+      try {
+        // Fetch launcher stats
+        try {
+          const launcherRes = await fetch('https://api.hytalef2p.com/api/players/stats');
+          const launcher = await launcherRes.json();
+          document.getElementById('launcherOnline').textContent = launcher.online || 0;
+          document.getElementById('launcherPeak').textContent = launcher.peak || 0;
+        } catch (e) {
+          document.getElementById('launcherOnline').textContent = '?';
+          document.getElementById('launcherPeak').textContent = '?';
+        }
+
+        // Fetch stats (lightweight)
+        const statsRes = await authFetch('/admin/stats');
+        const stats = await statsRes.json();
+        
+        // Update stats
+        document.getElementById('playerCount').textContent = stats.activePlayers || 0;
+        document.getElementById('serverCount').textContent = stats.activeServers || 0;
+        document.getElementById('sessionCount').textContent = stats.activeSessions || 0;
+        document.getElementById('userCount').textContent = stats.keys?.users || 0;
+        // Update Redis status
+        const redisStatus = document.getElementById('redisStatus');
+        const redisInfo = document.getElementById('redisInfo');
+        if (stats.redis?.connected) {
+          redisStatus.className = 'status-dot online';
+          redisInfo.innerHTML = \`
+            <div class="redis-status">
+              <strong>Connected</strong> |
+              Sessions: \${stats.keys?.sessions || 0} |
+              Auth Grants: \${stats.keys?.authGrants || 0} |
+              Users: \${stats.keys?.users || 0}
+            </div>
+          \`;
+        } else {
+          redisStatus.className = 'status-dot offline';
+          redisInfo.textContent = 'Not connected - data will not persist!';
+        }
+
+        // Fetch servers (paginated)
+        await loadServers(currentPage);
+
+        // Update timestamp
+        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+
+      } catch (e) {
+        console.error('Failed to fetch stats:', e);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Refresh Data';
+      }
+    }
+
+    async function loadServers(page) {
+      const serversList = document.getElementById('serversList');
+      serversList.innerHTML = '<div class="no-data">Loading servers...</div>';
+
+      try {
+        const res = await authFetch(\`/admin/servers?page=\${page}&limit=\${pageLimit}\`);
+        const data = await res.json();
+
+        if (data.servers && data.servers.length > 0) {
+          let html = data.servers.map(server => {
+            const minTtl = server.players && server.players.length > 0
+              ? Math.min(...server.players.map(p => p.ttl || 0))
+              : 0;
+            const serverTtlStatus = getTtlStatus(minTtl);
+            const isAllPlayers = server.audience === 'hytale-client';
+            const serverId = 'server-' + server.audience.replace(/[^a-zA-Z0-9]/g, '');
+
+            return \`
+            <div class="server-card\${isAllPlayers ? ' all-players-server' : ''}">
+              <div class="server-header">
+                <span class="server-name">
+                  \${isAllPlayers ? '<span class="all-players-badge">ALL ONLINE</span> All Players (Valid Tokens)' : (server.name || server.audience || 'Unknown Server')}
+                  <span class="ttl-badge \${serverTtlStatus.class} server-ttl">\${serverTtlStatus.text}</span>
+                </span>
+                <span class="player-count">\${server.playerCount} player\${server.playerCount !== 1 ? 's' : ''}</span>
+              </div>
+              \${server.name && !isAllPlayers ? \`<div class="server-audience">ID: \${server.audience}</div>\` : ''}
+              \${server.players && server.players.length > 0 ? \`
+                \${isAllPlayers ? \`<div class="collapse-toggle" onclick="togglePlayers('\${serverId}')">Show/Hide Players</div>\` : ''}
+                <div class="players-list\${isAllPlayers ? ' collapsed' : ''}" id="\${serverId}">
+                  \${server.players.map(p => {
+                    const ttlStatus = getTtlStatus(p.ttl || 0);
+                    return \`
+                    <div class="player-tag">
+                      <span class="player-name">\${p.username} <span class="ttl-badge \${ttlStatus.class}">\${ttlStatus.text}</span></span>
+                      <span class="uuid">\${p.uuid.substring(0, 8)}...</span>
+                    </div>
+                  \`}).join('')}
+                </div>
+              \` : ''}
+            </div>
+          \`}).join('');
+
+          // Add pagination controls
+          const pg = data.pagination;
+          html += \`
+            <div class="pagination">
+              <button onclick="changePage(\${pg.page - 1})" \${!pg.hasPrev ? 'disabled' : ''}>Previous</button>
+              <span>Page \${pg.page} of \${pg.totalPages} (\${pg.totalServers} servers)</span>
+              <button onclick="changePage(\${pg.page + 1})" \${!pg.hasNext ? 'disabled' : ''}>Next</button>
+            </div>
+          \`;
+
+          serversList.innerHTML = html;
+        } else {
+          serversList.innerHTML = '<div class="no-data">No active servers</div>';
+        }
+      } catch (e) {
+        serversList.innerHTML = '<div class="no-data">Failed to load servers</div>';
+      }
+    }
+
+    function changePage(page) {
+      if (page < 1) return;
+      currentPage = page;
+      loadServers(page);
+    }
+
+    // Toggle players list visibility
+    function togglePlayers(serverId) {
+      const el = document.getElementById(serverId);
+      if (el) {
+        el.classList.toggle('collapsed');
+      }
+    }
+
+    // Initial load
+    refreshData();
+
+    // Auto-refresh every 30 seconds
+    setInterval(refreshData, 30000);
+
+    // Server name form handler
+    document.getElementById('serverNameForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const audience = document.getElementById('serverAudience').value.trim();
+      const name = document.getElementById('serverDisplayName').value.trim();
+      const resultDiv = document.getElementById('serverNameResult');
+
+      if (!audience || !name) {
+        resultDiv.innerHTML = '<span style="color: #ff6b6b;">Please fill in both fields</span>';
+        return;
+      }
+
+      try {
+        const res = await authFetch('/admin/server-name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audience, name })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          resultDiv.innerHTML = '<span style="color: #00d4ff;">Server name set successfully!</span>';
+          document.getElementById('serverAudience').value = '';
+          document.getElementById('serverDisplayName').value = '';
+          refreshData();
+        } else {
+          resultDiv.innerHTML = '<span style="color: #ff6b6b;">Error: ' + (data.error || 'Unknown error') + '</span>';
+        }
+      } catch (err) {
+        resultDiv.innerHTML = '<span style="color: #ff6b6b;">Request failed: ' + err.message + '</span>';
+      }
+    });
+  </script>
+</body>
+</html>`;
+
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(html);
 }
 
 function handleSession(req, res, body, uuid, name) {
@@ -975,15 +2510,149 @@ function handleProfile(req, res, body, uuid, name) {
   });
 }
 
-function handleSkin(req, res, body, uuid, name) {
+// Profile lookup by UUID - used by ProfileServiceClient.getProfileByUuid()
+// Returns PublicGameProfile format: { uuid, username }
+async function handleProfileLookupByUuid(req, res, lookupUuid, headers) {
+  const serverAudience = extractServerAudienceFromHeaders(headers);
+  console.log('Profile lookup by UUID:', lookupUuid, serverAudience ? `(server: ${serverAudience})` : '(no server context)');
+
+  // Try to find username in our caches and storage
+  let username = null;
+
+  // First, check if player is active on this server (most accurate)
+  if (serverAudience) {
+    const players = await getPlayersOnServer(serverAudience);
+    const activePlayer = players.find(p => p.uuid === lookupUuid);
+    if (activePlayer) {
+      username = activePlayer.username;
+      console.log(`Found active player on server: ${username}`);
+    }
+  }
+
+  // Check in-memory cache first
+  if (!username && uuidUsernameCache.has(lookupUuid)) {
+    username = uuidUsernameCache.get(lookupUuid);
+  }
+
+  // Check Redis for persisted username
+  if (!username) {
+    username = await getUsername(lookupUuid);
+  }
+
+  // If not found, return a generic name based on UUID
+  // This ensures commands like /ban <uuid> always work
+  if (!username) {
+    username = `Player_${lookupUuid.substring(0, 8)}`;
+    console.log(`UUID ${lookupUuid} not found in records, returning generic name`);
+  }
+
+  sendJson(res, 200, {
+    uuid: lookupUuid,
+    username: username
+  });
+}
+
+// Profile lookup by username - used by ProfileServiceClient.getProfileByUsername()
+// Returns PublicGameProfile format: { uuid, username }
+// Server-scoped: First looks for the player on the requesting server, then falls back to global search.
+// This prevents issues with duplicate usernames across different servers.
+async function handleProfileLookupByUsername(req, res, lookupUsername, headers) {
+  const serverAudience = extractServerAudienceFromHeaders(headers);
+  console.log('Profile lookup by username:', lookupUsername, serverAudience ? `(server: ${serverAudience})` : '(no server context)');
+
+  // PRIORITY 1: Check active players on this specific server
+  // This is the most accurate for commands like /ban <username> on a specific server
+  if (serverAudience) {
+    const serverMatches = await findPlayerOnServer(serverAudience, lookupUsername);
+    if (serverMatches.length === 1) {
+      console.log(`Found unique player "${lookupUsername}" on server ${serverAudience}: ${serverMatches[0].uuid}`);
+      sendJson(res, 200, {
+        uuid: serverMatches[0].uuid,
+        username: serverMatches[0].username
+      });
+      return;
+    } else if (serverMatches.length > 1) {
+      // Multiple players with same username on same server - pick first (shouldn't happen often)
+      console.log(`Multiple players with username "${lookupUsername}" on server ${serverAudience}, returning first: ${serverMatches[0].uuid}`);
+      sendJson(res, 200, {
+        uuid: serverMatches[0].uuid,
+        username: serverMatches[0].username
+      });
+      return;
+    }
+    // No match on this server, fall through to global search
+    console.log(`Player "${lookupUsername}" not found on server ${serverAudience}, searching globally`);
+  }
+
+  // PRIORITY 2: Global search - check local cache first, then scan all sessions
+  const matches = [];
+
+  // Check in-memory cache (fastest)
+  for (const [uuid, name] of uuidUsernameCache.entries()) {
+    if (name.toLowerCase() === lookupUsername.toLowerCase()) {
+      matches.push({
+        uuid,
+        username: name,
+        lastSeen: new Date().toISOString() // Currently in cache, so recent
+      });
+    }
+  }
+
+  // If Redis is connected, scan for more matches in all sessions
+  if (redisConnected && matches.length === 0) {
+    try {
+      // Get all sessions and search for username
+      const { sessions } = await getAllActiveSessions();
+      for (const session of sessions) {
+        if (session.username && session.username.toLowerCase() === lookupUsername.toLowerCase()) {
+          if (!matches.find(m => m.uuid === session.uuid)) {
+            matches.push({
+              uuid: session.uuid,
+              username: session.username,
+              lastSeen: session.createdAt || new Date().toISOString()
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to search sessions:', e.message);
+    }
+  }
+
+  if (matches.length === 0) {
+    // Username not found - return 404
+    console.log('Username not found:', lookupUsername);
+    sendJson(res, 404, {
+      error: 'Profile not found',
+      message: `No profile found for username: ${lookupUsername}`
+    });
+    return;
+  }
+
+  if (matches.length > 1) {
+    console.log(`Multiple players with username "${lookupUsername}" globally: ${matches.map(m => m.uuid).join(', ')}`);
+    // Sort by lastSeen descending (most recent first)
+    matches.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+  }
+
+  // Return the most recently seen player with this username
+  const bestMatch = matches[0];
+  console.log(`Returning profile for "${lookupUsername}": ${bestMatch.uuid} (${matches.length} total global matches)`);
+
+  sendJson(res, 200, {
+    uuid: bestMatch.uuid,
+    username: bestMatch.username
+  });
+}
+
+async function handleSkin(req, res, body, uuid, name) {
   console.log('skin update:', uuid);
 
-  if (!userData[uuid]) {
-    userData[uuid] = {};
-  }
-  userData[uuid].skin = body;
-  userData[uuid].lastUpdated = new Date().toISOString();
-  saveUserData(userData);
+  // Get existing user data and update skin
+  const existingData = await getUserData(uuid);
+  existingData.skin = body;
+  existingData.lastUpdated = new Date().toISOString();
+  await saveUserData(uuid, existingData);
 
   res.writeHead(204);
   res.end();
@@ -1005,12 +2674,13 @@ function handleLauncherData(req, res, body, uuid, name) {
   });
 }
 
-function handleGameProfile(req, res, body, uuid, name) {
+async function handleGameProfile(req, res, body, uuid, name) {
   const nextNameChange = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
   let skin = null;
-  if (userData[uuid] && userData[uuid].skin) {
-    skin = JSON.stringify(userData[uuid].skin);
+  const userDataObj = await getUserData(uuid);
+  if (userDataObj && userDataObj.skin) {
+    skin = JSON.stringify(userDataObj.skin);
   }
 
   sendJson(res, 200, {
@@ -1071,9 +2741,28 @@ function handleCosmetics(req, res, body, uuid, name) {
   });
 }
 
-function sendJson(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(data));
+function sendJson(res, status, data, req = null) {
+  const json = JSON.stringify(data);
+
+  // Check if client accepts gzip and response is large enough to benefit
+  const acceptEncoding = req?.headers?.['accept-encoding'] || '';
+  if (acceptEncoding.includes('gzip') && json.length > 1024) {
+    zlib.gzip(json, (err, compressed) => {
+      if (err) {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(json);
+      } else {
+        res.writeHead(status, {
+          'Content-Type': 'application/json',
+          'Content-Encoding': 'gzip'
+        });
+        res.end(compressed);
+      }
+    });
+  } else {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(json);
+  }
 }
 
 // Handle avatar viewer routes
@@ -1122,9 +2811,10 @@ function serveAvatarViewer(req, res, uuid) {
 }
 
 // Handle avatar model data request
-function handleAvatarModel(req, res, uuid) {
-  // Get user skin data
-  const userSkin = userData[uuid]?.skin || null;
+async function handleAvatarModel(req, res, uuid) {
+  // Get user skin data from Redis
+  const userDataObj = await getUserData(uuid);
+  const userSkin = userDataObj?.skin || null;
 
   if (!userSkin) {
     sendJson(res, 404, { error: 'User skin not found', uuid });
@@ -3168,15 +4858,29 @@ if (fs.existsSync(ASSETS_PATH)) {
   console.log('Assets.zip not found, using fallback cosmetics');
 }
 
-const server = http.createServer(handleRequest);
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Endpoints:`);
-  console.log(`  - sessions.${DOMAIN}`);
-  console.log(`  - account-data.${DOMAIN}`);
-  console.log(`  - telemetry.${DOMAIN}`);
-  console.log(`  - Avatar viewer: /avatar/{uuid}`);
-  console.log(`  - Avatar customizer: /customizer/{uuid}`);
-  console.log(`  - Cosmetics list: /cosmetics/list`);
-  console.log(`  - Asset extraction: /asset/{path}`);
+// Initialize Redis and start server
+async function startServer() {
+  // Connect to Redis
+  await initializeRedis();
+
+  const server = http.createServer(handleRequest);
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Redis: ${redisConnected ? 'connected' : 'NOT CONNECTED (data will not persist!)'}`);
+    console.log(`Endpoints:`);
+    console.log(`  - sessions.${DOMAIN}`);
+    console.log(`  - account-data.${DOMAIN}`);
+    console.log(`  - telemetry.${DOMAIN}`);
+    console.log(`  - Avatar viewer: /avatar/{uuid}`);
+    console.log(`  - Avatar customizer: /customizer/{uuid}`);
+    console.log(`  - Cosmetics list: /cosmetics/list`);
+    console.log(`  - Asset extraction: /asset/{path}`);
+    console.log(`  - Admin dashboard: /admin`);
+    console.log(`  - Admin API: /admin/sessions, /admin/stats`);
+  });
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
