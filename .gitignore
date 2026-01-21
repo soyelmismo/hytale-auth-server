@@ -18,3 +18,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test coverage output
+coverage/
+
+# Legacy code (old monolithic server.js)
+legacy/

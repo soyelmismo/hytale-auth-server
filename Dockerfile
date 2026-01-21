@@ -12,11 +12,13 @@ RUN mkdir -p /app/data /app/assets
 COPY package*.json ./
 RUN npm install --omit=dev
 
-# Copy server and static assets
-COPY server.js ./
-COPY assets/*.js ./assets/
-COPY assets/*.html ./assets/
+# Copy source code
+COPY src/ ./src/
+
+# Copy static assets
+COPY assets/avatar.js ./assets/
+COPY assets/customizer.html ./assets/
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["node", "src/app.js"]
