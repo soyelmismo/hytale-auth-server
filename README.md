@@ -6,6 +6,15 @@ This server handles authentication requests from both the game client (via the F
 
 > **Warning**: This is an experimental project for educational purposes. Use at your own risk.
 
+## Preview
+
+![Avatar Viewer](.github/avatar_dab_pose.png)
+![Customizer](.github/customizer.png)
+
+[![Avatar Viewer Video](https://img.youtube.com/vi/aDqYWr8rcwg/0.jpg)](https://youtube.com/shorts/aDqYWr8rcwg)
+
+**Live Demo:** [Avatar Customizer](https://sessions.sanasol.ws/customizer/03fbfdef-9c4a-4eef-bd10-63fa96427133)
+
 ## Public Test Server
 
 **You don't need to run your own auth server!** A public test server is available at `sanasol.ws` and is used by default in all related projects.
@@ -123,6 +132,50 @@ The server stores the following data in the `data/` directory:
 
 **Important**: Keep `jwt_keys.json` backed up! If you lose it, all existing tokens become invalid.
 
+## Avatar Viewer & Customizer (Research Prototype)
+
+> **Note**: This is a research prototype and does not work fully. It's included for educational purposes to demonstrate how Hytale's character models and cosmetics system works.
+
+The server includes an experimental web-based avatar viewer and customizer that reads from `Assets.zip` to render 3D character models using Three.js.
+
+### Avatar Viewer
+
+View any user's avatar in 3D with animations:
+
+```
+https://sessions.yourdomain/avatar/{uuid}
+```
+
+Features:
+- 3D character rendering from `.blockymodel` files
+- Animation playback (Idle, Walk, Run, Jump, Emotes, etc.)
+- Skin tone and body type support
+- Cosmetic parts rendering (hair, clothes, accessories)
+
+### Customizer
+
+Interactive character customization interface:
+
+```
+https://sessions.yourdomain/customizer/{uuid}
+```
+
+Features:
+- Browse all cosmetic categories (Head, Torso, Arms, Legs, Capes)
+- Live preview of cosmetic changes
+- Color variations for supported items
+- Animation preview
+
+### How It Works
+
+The viewer parses Hytale's asset format:
+- `.blockymodel` - 3D model definitions with bone hierarchy
+- `.blockyanim` - Animation keyframe data
+- Greyscale textures with gradient-based coloring
+- Character cosmetic configuration from `CharacterCreator/*.json`
+
+This is a reverse-engineering research project to understand Hytale's asset format.
+
 ## Endpoints
 
 The server implements the following Hytale authentication endpoints:
@@ -138,6 +191,11 @@ The server implements the following Hytale authentication endpoints:
 | `/my-account/game-profile` | Get user profile |
 | `/my-account/cosmetics` | Get unlocked cosmetics |
 | `/my-account/skin` | Save user skin preferences |
+| `/avatar/{uuid}` | 3D avatar viewer (research prototype) |
+| `/avatar/{uuid}/model` | Avatar model data API |
+| `/customizer/{uuid}` | Avatar customizer UI (research prototype) |
+| `/cosmetics/list` | List all available cosmetics |
+| `/asset/{path}` | Serve assets from Assets.zip |
 
 ## Local Development (without HTTPS)
 
