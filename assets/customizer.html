@@ -320,6 +320,32 @@
       border-radius: 4px;
     }
 
+    .thumbnail-3d {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, rgba(30, 45, 70, 0.8) 0%, rgba(20, 35, 55, 0.9) 100%);
+    }
+
+    .thumbnail-3d img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .thumbnail-loading {
+      color: rgba(150, 170, 190, 0.5);
+      font-size: 16px;
+      animation: pulse 1s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.3; }
+      50% { opacity: 1; }
+    }
+
     .style-item .item-icon {
       position: absolute;
       top: 4px;
@@ -695,6 +721,7 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="/assets/avatar.js"></script>
+  <script src="/assets/thumbnail-renderer.js"></script>
   <script>
     // Category definitions matching Hytale's structure with distinctive icons
     const CATEGORIES = {
@@ -769,6 +796,7 @@
     let colorHexMap = {};        // colorId -> hex color
     let gradientSetsInfo = [];   // gradient sets with their color lists
     let viewer = null;
+    let thumbnailRenderer = null; // 3D thumbnail renderer
     let refreshDebounce = null;
 
     // Get UUID from URL or generate test one
@@ -788,6 +816,11 @@
       setupCategories();
       setupControls();
       await loadCosmeticItems();
+
+      // Initialize 3D thumbnail renderer
+      thumbnailRenderer = new ThumbnailRenderer();
+      await thumbnailRenderer.init();
+
       await initViewer();
       selectCategory('head');
       selectSubcategory('eyes');
@@ -920,6 +953,8 @@
       grid.innerHTML = '';
 
       const selectedId = currentSkin[categoryKey];
+      const selectedColor = currentColors[categoryKey];
+      const skinTone = currentSkin.skinTone || '01';
 
       // Add "None" option
       const noneItem = document.createElement('div');
@@ -949,14 +984,12 @@
         // Display name (clean up the ID for display)
         const displayName = itemData.id.replace(/_/g, ' ');
 
-        // Create thumbnail from texture image
-        let thumbnailHtml = '<div class="thumbnail-placeholder"></div>';
-        if (itemData.thumbnail) {
-          // Asset paths work with the /asset/ route which tries multiple prefixes
-          const thumbnailUrl = '/asset/' + itemData.thumbnail;
-          thumbnailHtml = `<img src="${thumbnailUrl}" alt="${displayName}" loading="lazy" onerror="handleThumbnailError(this, '${itemData.thumbnail}')">
-            <div class="thumbnail-placeholder" style="display:none"></div>`;
-        }
+        // Create placeholder for 3D thumbnail (will be rendered async)
+        const thumbnailHtml = `
+          <div class="thumbnail-3d" data-category="${categoryKey}" data-item-id="${itemData.id}">
+            <div class="thumbnail-loading">...</div>
+          </div>
+        `;
 
         item.innerHTML = `
           ${thumbnailHtml}
@@ -969,6 +1002,16 @@
 
         item.onclick = () => selectStyle(categoryKey, itemData.id, itemData.colors);
         grid.appendChild(item);
+
+        // Queue 3D thumbnail rendering (async, don't await)
+        // Thumbnails ALWAYS show the item's default (first) color - never affected by selection
+        if (thumbnailRenderer) {
+          const thumbContainer = item.querySelector('.thumbnail-3d');
+          const itemColors = itemData.colors || [];
+          // Always use the item's first color for thumbnails - selection doesn't change this
+          const colorForThumb = itemColors.length > 0 ? itemColors[0] : null;
+          render3DThumbnail(thumbContainer, categoryKey, itemData.id, colorForThumb, skinTone);
+        }
       }
 
       // If no items, show placeholder
@@ -977,6 +1020,21 @@
         placeholder.style.cssText = 'grid-column: 1/-1; text-align: center; padding: 40px 20px; color: rgba(150,170,190,0.5); font-size: 13px;';
         placeholder.textContent = 'No items available';
         grid.appendChild(placeholder);
+      }
+    }
+
+    // Render a 3D thumbnail asynchronously
+    async function render3DThumbnail(container, category, itemId, colorId, skinTone) {
+      try {
+        const dataUrl = await thumbnailRenderer.renderThumbnail(category, itemId, colorId, skinTone);
+        if (dataUrl) {
+          container.innerHTML = `<img src="${dataUrl}" alt="${itemId}">`;
+        } else {
+          container.innerHTML = '<div class="thumbnail-placeholder">?</div>';
+        }
+      } catch (err) {
+        console.warn('Thumbnail render failed:', category, itemId, err);
+        container.innerHTML = '<div class="thumbnail-placeholder">!</div>';
       }
     }
 
@@ -1172,12 +1230,37 @@
         }
       }
 
-      // Update UI
-      loadStylesForCategory(categoryKey);
+      // Update selection state without re-rendering thumbnails
+      updateStyleSelection(categoryKey, itemId);
       loadColorsForCategory(categoryKey);
 
-      // Refresh preview with debounce
+      // Refresh avatar preview with debounce
       scheduleRefresh();
+    }
+
+    // Update just the selection visual state without rebuilding the grid
+    function updateStyleSelection(categoryKey, selectedId) {
+      const grid = document.getElementById('style-grid');
+      const items = grid.querySelectorAll('.style-item');
+
+      items.forEach(item => {
+        const itemId = item.dataset.id;
+        if (itemId === selectedId) {
+          item.classList.add('selected');
+        } else {
+          item.classList.remove('selected');
+        }
+      });
+
+      // Handle "None" option
+      const noneOption = grid.querySelector('.none-option');
+      if (noneOption) {
+        if (!selectedId) {
+          noneOption.classList.add('selected');
+        } else {
+          noneOption.classList.remove('selected');
+        }
+      }
     }
 
     function selectColor(categoryKey, colorId) {

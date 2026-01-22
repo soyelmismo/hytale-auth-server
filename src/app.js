@@ -233,12 +233,6 @@ async function routeRequest(req, res, url, urlPath, body, uuid, name, tokenScope
     return;
   }
 
-  // Avatar debug viewer with toggleable fixes
-  if (urlPath === '/avatar-debug' || urlPath === '/avatar/debug') {
-    routes.avatar.handleAvatarDebugRoute(req, res);
-    return;
-  }
-
   // Protected admin API routes - require token
   if (urlPath.startsWith('/admin/')) {
     const validToken = await middleware.verifyAdminAuth(headers);
