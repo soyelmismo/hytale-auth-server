@@ -133,7 +133,7 @@ The patcher extracts the base domain for issuer validation:
 ### Download URL
 
 ```
-https://raw.githubusercontent.com/sanasol/hytale-auth-server/main/patcher/DualAuthPatcher.java
+https://raw.githubusercontent.com/sanasol/hytale-auth-server/master/patcher/DualAuthPatcher.java
 ```
 
 ### For hytale-server-docker
