@@ -2,6 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const config = require('../config');
 
+// Lazy-load metrics to avoid circular dependency
+let metrics = null;
+function getMetrics() {
+  if (!metrics) {
+    try { metrics = require('./metrics'); } catch (e) {}
+  }
+  return metrics;
+}
+
 // Log file path
 const LOG_DIR = process.env.LOG_DIR || path.join(config.dataDir, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'requests.log');
@@ -166,6 +175,18 @@ function logRequest(req, res, body = null, responseTime = 0) {
         console.error('Failed to write log:', err.message);
       }
     });
+
+    // Track metrics (non-blocking)
+    try {
+      const m = getMetrics();
+      if (m) {
+        m.incCounter('requests_total', {
+          method,
+          status: statusCode,
+          endpoint: url.split('?')[0]
+        });
+      }
+    } catch (e) {}
   } catch (err) {
     console.error('Request logging failed:', err.message);
   }
