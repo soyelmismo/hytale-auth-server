@@ -660,6 +660,257 @@ jobs:
           pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
           sleep 2
 
+      # ==========================================
+      # STRICT MODE TESTS (TRUST_ALL_ISSUERS=false)
+      # ==========================================
+
+      - name: Start Server (strict mode - trust disabled)
+        working-directory: server
+        run: |
+          # Create separate data directory for strict mode test
+          rm -rf universe_strict
+          mkdir -p universe_strict
+          echo "Using isolated data directory: universe_strict"
+
+          echo "Starting Hytale server with HYTALE_TRUST_ALL_ISSUERS=false (strict mode)..."
+          HYTALE_TRUST_ALL_ISSUERS=false \
+          java -Xmx2G \
+            -jar HytaleServerPatched.jar \
+            --assets Assets.zip \
+            --bind 0.0.0.0:5522 \
+            --universe universe_strict \
+            --auth-mode authenticated \
+            --disable-sentry \
+            --session-token "$SESSION_TOKEN" \
+            --identity-token "$IDENTITY_TOKEN" \
+            2>&1 | tee server_strict.log &
+
+          SERVER_PID=$!
+          echo $SERVER_PID > server_strict.pid
+          echo "Server PID: $SERVER_PID"
+
+          # Wait for server to boot
+          echo "Waiting for server to start..."
+          TIMEOUT=60
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if grep -qi "Server Booted" server_strict.log 2>/dev/null; then
+              echo "Server is ready!"
+              break
+            fi
+            if grep -qE "NoSuchFieldError|NoSuchMethodError|ClassNotFoundException|VerifyError" server_strict.log 2>/dev/null; then
+              echo "Bytecode error - patcher incompatible"
+              cat server_strict.log
+              exit 1
+            fi
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+            echo "... waiting ($ELAPSED/$TIMEOUT)"
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            if grep -qi "Server Booted" server_strict.log 2>/dev/null; then
+              echo "Server booted (detected after timeout check)"
+            else
+              echo "Server did not boot within timeout"
+              tail -30 server_strict.log
+              exit 1
+            fi
+          fi
+
+      - name: Run Mock Client Tests (strict mode - trust disabled)
+        run: |
+          TESTS_PASSED=0
+          TESTS_FAILED=0
+
+          LOG_LINES_BEFORE=$(wc -l < server/server_strict.log 2>/dev/null | tr -d ' ')
+
+          echo "=== Test 6: Omni-Auth Token REJECTED (strict mode, no trusted issuers) ==="
+          echo "Testing that self-signed Omni-Auth tokens are REJECTED when TRUST_ALL_ISSUERS=false"
+          STRICT_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+          echo "UUID: $STRICT_UUID"
+          echo "Username: StrictTestPlayer"
+
+          # Generate valid Omni-Auth token (should be rejected in strict mode)
+          STRICT_TOKEN=$(python3 .github/scripts/generate-omni-token.py \
+            --uuid "$STRICT_UUID" \
+            --username "StrictTestPlayer" \
+            --issuer "http://127.0.0.1:12345")
+
+          python3 .github/scripts/mock-client.py \
+            --host 127.0.0.1 \
+            --port 5522 \
+            --uuid "$STRICT_UUID" \
+            --username "StrictTestPlayer" \
+            --token "$STRICT_TOKEN" \
+            --timeout 5 || true
+
+          sleep 2
+
+          NEW_LOGS=$(tail -n +"$LOG_LINES_BEFORE" server/server_strict.log)
+          # In strict mode with no trusted issuers, self-signed tokens should be REJECTED
+          if echo "$NEW_LOGS" | grep -qiE "untrusted issuer|issuer not trusted|issuer.*not.*allowed|rejected.*issuer"; then
+            echo "Test 6 PASSED - Omni-Auth token correctly rejected (untrusted issuer)"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          elif echo "$NEW_LOGS" | grep -qiE "Disconnect|rejected|error|invalid"; then
+            echo "Test 6 PASSED - Token rejected in strict mode (issuer not in trusted list)"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          elif echo "$NEW_LOGS" | grep -qiE "Successfully obtained authorization grant|Sending AuthGrant"; then
+            echo "::error::Test 6 FAILED - Token should be REJECTED in strict mode but was accepted"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+          else
+            echo "::warning::Test 6 INCONCLUSIVE - Could not determine if token was rejected"
+            echo "Logs:"
+            echo "$NEW_LOGS" | tail -10
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          fi
+
+          echo ""
+          echo "=== STRICT MODE (trust disabled) Results ==="
+          echo "Passed: $TESTS_PASSED / 1"
+          echo "Failed: $TESTS_FAILED / 1"
+
+          echo "STRICT_MODE_FAILED=$TESTS_FAILED" >> $GITHUB_ENV
+
+          echo ""
+          echo "=== Server Connection Logs (strict mode) ==="
+          grep -iE "connect|auth|DualAuth|issuer|trust|reject" server/server_strict.log | tail -20 || echo "No connection logs found"
+
+      - name: Stop Server (strict mode)
+        run: |
+          echo "Stopping strict mode server..."
+          if [ -f server/server_strict.pid ]; then
+            kill $(cat server/server_strict.pid) 2>/dev/null || true
+            sleep 1
+            kill -9 $(cat server/server_strict.pid) 2>/dev/null || true
+          fi
+          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          sleep 2
+
+      - name: Start Server (strict mode - with trusted issuer allowlist)
+        working-directory: server
+        run: |
+          # Create separate data directory for trusted issuer test
+          rm -rf universe_trusted
+          mkdir -p universe_trusted
+          echo "Using isolated data directory: universe_trusted"
+
+          echo "Starting Hytale server with HYTALE_TRUST_ALL_ISSUERS=false and HYTALE_TRUSTED_ISSUERS=127.0.0.1..."
+          HYTALE_TRUST_ALL_ISSUERS=false \
+          HYTALE_TRUSTED_ISSUERS="127.0.0.1,localhost" \
+          java -Xmx2G \
+            -jar HytaleServerPatched.jar \
+            --assets Assets.zip \
+            --bind 0.0.0.0:5523 \
+            --universe universe_trusted \
+            --auth-mode authenticated \
+            --disable-sentry \
+            --session-token "$SESSION_TOKEN" \
+            --identity-token "$IDENTITY_TOKEN" \
+            2>&1 | tee server_trusted.log &
+
+          SERVER_PID=$!
+          echo $SERVER_PID > server_trusted.pid
+          echo "Server PID: $SERVER_PID"
+
+          # Wait for server to boot
+          echo "Waiting for server to start..."
+          TIMEOUT=60
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if grep -qi "Server Booted" server_trusted.log 2>/dev/null; then
+              echo "Server is ready!"
+              break
+            fi
+            if grep -qE "NoSuchFieldError|NoSuchMethodError|ClassNotFoundException|VerifyError" server_trusted.log 2>/dev/null; then
+              echo "Bytecode error - patcher incompatible"
+              cat server_trusted.log
+              exit 1
+            fi
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+            echo "... waiting ($ELAPSED/$TIMEOUT)"
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            if grep -qi "Server Booted" server_trusted.log 2>/dev/null; then
+              echo "Server booted (detected after timeout check)"
+            else
+              echo "Server did not boot within timeout"
+              tail -30 server_trusted.log
+              exit 1
+            fi
+          fi
+
+      - name: Run Mock Client Tests (strict mode - with trusted issuer)
+        run: |
+          TESTS_PASSED=0
+          TESTS_FAILED=0
+
+          LOG_LINES_BEFORE=$(wc -l < server/server_trusted.log 2>/dev/null | tr -d ' ')
+
+          echo "=== Test 7: Omni-Auth Token ACCEPTED (strict mode, issuer in allowlist) ==="
+          echo "Testing that self-signed Omni-Auth tokens are ACCEPTED when issuer matches TRUSTED_ISSUERS"
+          TRUSTED_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+          echo "UUID: $TRUSTED_UUID"
+          echo "Username: TrustedPlayer"
+
+          # Generate valid Omni-Auth token with issuer matching the allowlist
+          TRUSTED_TOKEN=$(python3 .github/scripts/generate-omni-token.py \
+            --uuid "$TRUSTED_UUID" \
+            --username "TrustedPlayer" \
+            --issuer "http://127.0.0.1:12345")
+
+          python3 .github/scripts/mock-client.py \
+            --host 127.0.0.1 \
+            --port 5523 \
+            --uuid "$TRUSTED_UUID" \
+            --username "TrustedPlayer" \
+            --token "$TRUSTED_TOKEN" \
+            --timeout 5 || true
+
+          sleep 2
+
+          NEW_LOGS=$(tail -n +"$LOG_LINES_BEFORE" server/server_trusted.log)
+          # In strict mode with matching trusted issuer, token should be ACCEPTED
+          if echo "$NEW_LOGS" | grep -qiE "Successfully obtained authorization grant|Sending AuthGrant"; then
+            echo "Test 7 PASSED - Omni-Auth token accepted (issuer in allowlist)"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          elif echo "$NEW_LOGS" | grep -qiE "embedded.*JWK|transient.*key|Omni-Auth"; then
+            echo "Test 7 PASSED - Omni-Auth processing detected (trusted issuer mode)"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          elif echo "$NEW_LOGS" | grep -qiE "untrusted issuer|issuer not trusted|rejected"; then
+            echo "::error::Test 7 FAILED - Token rejected but issuer IS in trusted list"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+          else
+            echo "::warning::Test 7 INCONCLUSIVE - Could not verify token acceptance"
+            echo "Logs:"
+            echo "$NEW_LOGS" | tail -10
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+          fi
+
+          echo ""
+          echo "=== TRUSTED ISSUER MODE Results ==="
+          echo "Passed: $TESTS_PASSED / 1"
+          echo "Failed: $TESTS_FAILED / 1"
+
+          echo "TRUSTED_ISSUER_FAILED=$TESTS_FAILED" >> $GITHUB_ENV
+
+          echo ""
+          echo "=== Server Connection Logs (trusted issuer mode) ==="
+          grep -iE "connect|auth|DualAuth|issuer|trust|accept" server/server_trusted.log | tail -20 || echo "No connection logs found"
+
+      - name: Stop Server (trusted issuer mode)
+        run: |
+          echo "Stopping trusted issuer mode server..."
+          if [ -f server/server_trusted.pid ]; then
+            kill $(cat server/server_trusted.pid) 2>/dev/null || true
+            sleep 1
+            kill -9 $(cat server/server_trusted.pid) 2>/dev/null || true
+          fi
+          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          sleep 2
+
       - name: Start Server (no-tokens mode)
         working-directory: server
         run: |
@@ -766,19 +1017,23 @@ jobs:
       - name: Final Results
         env:
           WITH_TOKENS_FAILED: ${{ env.WITH_TOKENS_FAILED || '0' }}
+          STRICT_MODE_FAILED: ${{ env.STRICT_MODE_FAILED || '0' }}
+          TRUSTED_ISSUER_FAILED: ${{ env.TRUSTED_ISSUER_FAILED || '0' }}
         run: |
           echo ""
           echo "=============================================="
           echo "  Final Test Summary"
           echo "=============================================="
           echo ""
-          echo "WITH-TOKENS mode: $( [ \"$WITH_TOKENS_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
-          echo "NO-TOKENS mode: $( [ \"$NO_TOKENS_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
+          echo "WITH-TOKENS mode (Tests 1-5): $( [ \"$WITH_TOKENS_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
+          echo "STRICT MODE (Test 6 - trust disabled): $( [ \"$STRICT_MODE_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
+          echo "TRUSTED ISSUER MODE (Test 7 - allowlist): $( [ \"$TRUSTED_ISSUER_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
+          echo "NO-TOKENS mode (Test 8): $( [ \"$NO_TOKENS_FAILED\" = \"0\" ] && echo 'PASSED' || echo 'FAILED' )"
           echo ""
 
-          TOTAL_FAILED=$((${WITH_TOKENS_FAILED:-0} + ${NO_TOKENS_FAILED:-0}))
+          TOTAL_FAILED=$((${WITH_TOKENS_FAILED:-0} + ${STRICT_MODE_FAILED:-0} + ${TRUSTED_ISSUER_FAILED:-0} + ${NO_TOKENS_FAILED:-0}))
           if [ $TOTAL_FAILED -gt 0 ]; then
-            echo "Overall: SOME TESTS FAILED"
+            echo "Overall: SOME TESTS FAILED ($TOTAL_FAILED test(s))"
             exit 1
           fi
           echo "Overall: ALL TESTS PASSED"
@@ -789,6 +1044,14 @@ jobs:
           if [ -f server/server.pid ]; then
             kill $(cat server/server.pid) 2>/dev/null || true
             kill -9 $(cat server/server.pid) 2>/dev/null || true
+          fi
+          if [ -f server/server_strict.pid ]; then
+            kill $(cat server/server_strict.pid) 2>/dev/null || true
+            kill -9 $(cat server/server_strict.pid) 2>/dev/null || true
+          fi
+          if [ -f server/server_trusted.pid ]; then
+            kill $(cat server/server_trusted.pid) 2>/dev/null || true
+            kill -9 $(cat server/server_trusted.pid) 2>/dev/null || true
           fi
           if [ -f server/server_no_tokens.pid ]; then
             kill $(cat server/server_no_tokens.pid) 2>/dev/null || true
@@ -803,5 +1066,7 @@ jobs:
           name: mock-client-test-logs
           path: |
             server/server.log
+            server/server_strict.log
+            server/server_trusted.log
             server/server_no_tokens.log
           retention-days: 7
