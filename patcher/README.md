@@ -76,6 +76,10 @@ The patcher injects 6 helper classes into the server JAR:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HYTALE_AUTH_DOMAIN` | `auth.sanasol.ws` | F2P auth domain (4-16 chars) |
+| `HYTALE_TRUST_OFFICIAL` | `true` | Whether to trust official `hytale.com` issuers and fetch official JWKS |
+| `HYTALE_TRUST_ALL_ISSUERS` | `true` | Trust any issuer by default. Set to `false` to enforce `HYTALE_TRUSTED_ISSUERS` + official/F2P checks (and Omni-Auth tokens will be rejected in strict mode). |
+| `HYTALE_TRUSTED_ISSUERS` | *(empty)* | Comma-separated issuer allowlist. Entries may be full issuer URLs (exact match) or plain domains (validated via parsed URL host suffix match: `host == domain` or `host` ends with `.` + `domain`). Example: `https://auth.sanasol.ws,https://example.com` or `sanasol.ws` |
+| `HYTALE_JWKS_CACHE_TTL` | `3600` | JWKS cache TTL in seconds for merged network keys |
 
 ### Command Line
 

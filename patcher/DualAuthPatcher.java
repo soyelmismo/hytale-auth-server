@@ -39,6 +39,11 @@ public class DualAuthPatcher {
     // Extracts "sanasol.ws" from "auth.sanasol.ws"
     private static final String F2P_BASE_DOMAIN = extractBaseDomain(F2P_DOMAIN);
 
+    private static final boolean TRUST_ALL_ISSUERS = getEnvBoolean("HYTALE_TRUST_ALL_ISSUERS", true);
+    private static final boolean TRUST_OFFICIAL = getEnvBoolean("HYTALE_TRUST_OFFICIAL", true);
+    private static final Set<String> TRUSTED_ISSUERS = parseTrustedIssuers(System.getenv("HYTALE_TRUSTED_ISSUERS"));
+    private static final long JWKS_CACHE_TTL_MS = getEnvLongSeconds("HYTALE_JWKS_CACHE_TTL", 3600L) * 1000L;
+
     private static String extractBaseDomain(String domain) {
         // auth.sanasol.ws -> sanasol.ws
         // sanasol.ws -> sanasol.ws
@@ -51,6 +56,65 @@ public class DualAuthPatcher {
             }
         }
         return domain;
+    }
+
+    private static boolean getEnvBoolean(String name, boolean defaultValue) {
+        String raw = System.getenv(name);
+        if (raw == null) {
+            return defaultValue;
+        }
+        String v = raw.trim();
+        if (v.isEmpty()) {
+            return defaultValue;
+        }
+        return v.equalsIgnoreCase("true")
+                || v.equalsIgnoreCase("1")
+                || v.equalsIgnoreCase("yes")
+                || v.equalsIgnoreCase("y")
+                || v.equalsIgnoreCase("on");
+    }
+
+    private static long getEnvLongSeconds(String name, long defaultValueSeconds) {
+        String raw = System.getenv(name);
+        if (raw == null) {
+            return defaultValueSeconds;
+        }
+        String v = raw.trim();
+        if (v.isEmpty()) {
+            return defaultValueSeconds;
+        }
+        try {
+            long parsed = Long.parseLong(v);
+            return parsed > 0 ? parsed : defaultValueSeconds;
+        } catch (Exception ignored) {
+            return defaultValueSeconds;
+        }
+    }
+
+    private static Set<String> parseTrustedIssuers(String raw) {
+        Set<String> out = new HashSet<>();
+        if (raw == null) {
+            return out;
+        }
+        String v = raw.trim();
+        if (v.isEmpty()) {
+            return out;
+        }
+        String[] parts = v.split(",");
+        for (String p : parts) {
+            if (p == null) {
+                continue;
+            }
+            String s = p.trim();
+            if (s.isEmpty()) {
+                continue;
+            }
+            if (s.endsWith("/")) {
+                s = s.substring(0, s.length() - 1);
+            }
+            out.add(s);
+        }
+        return out;
     }
 
     // Package for injected classes
@@ -123,6 +187,10 @@ public class DualAuthPatcher {
         System.out.println("  Official: " + OFFICIAL_SESSION_URL + " (issuer: " + OFFICIAL_ISSUER + ")");
         System.out.println("  F2P:      " + F2P_SESSION_URL + " (issuer: " + F2P_ISSUER + ")");
         System.out.println("  F2P Base: *." + F2P_BASE_DOMAIN + " (backward compatible issuers)");
+        System.out.println("  Trust Official: " + TRUST_OFFICIAL);
+        System.out.println("  Trust All Issuers: " + TRUST_ALL_ISSUERS);
+        System.out.println("  Trusted Issuers: " + (TRUSTED_ISSUERS.isEmpty() ? "<none>" : TRUSTED_ISSUERS));
+        System.out.println("  JWKS Cache TTL (ms): " + JWKS_CACHE_TTL_MS);
         System.out.println();
 
         patchJar(inputJar, outputJar);
@@ -641,6 +709,8 @@ public class DualAuthPatcher {
     private static byte[] generateDualAuthHelper() {
         ClassWriter cw = new SafeClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
 
+        MethodVisitor mv;
+
         cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL,
                 HELPER_CLASS, null, "java/lang/Object", null);
 
@@ -655,7 +725,7 @@ public class DualAuthPatcher {
                 "F2P_ISSUER", "Ljava/lang/String;", null, F2P_ISSUER).visitEnd();
 
         // Private constructor
-        MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
+        mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
         mv.visitCode();
         mv.visitVarInsn(Opcodes.ALOAD, 0);
         mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
@@ -689,8 +759,7 @@ public class DualAuthPatcher {
         mv.visitCode();
 
         // Debug: Print the issuer being validated and expected domains
-        // System.out.println("[DualAuth] Validating issuer: " + issuer + " (accepts:
-        // hytale.com or *." + F2P_BASE_DOMAIN + ")");
+        // System.out.println("[DualAuth] Validating issuer: " + issuer + " (accepts: hytale.com or *." + F2P_BASE_DOMAIN + ")");
         mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
         mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder");
         mv.visitInsn(Opcodes.DUP);
@@ -710,9 +779,258 @@ public class DualAuthPatcher {
         mv.visitJumpInsn(Opcodes.IFNONNULL, checkNotNull);
         mv.visitInsn(Opcodes.ICONST_0);
         mv.visitInsn(Opcodes.IRETURN);
+
         mv.visitLabel(checkNotNull);
-        mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
-        // Check if contains hytale.com
+
+        // Normalize trailing slash
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitLdcInsn("/");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "endsWith", "(Ljava/lang/String;)Z", false);
+        Label skipNormalize = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, skipNormalize);
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "length", "()I", false);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.ISUB);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "substring", "(II)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 0);
+
+        mv.visitLabel(skipNormalize);
+
+        // HYTALE_TRUST_ALL_ISSUERS default TRUE:
+        // - unset/empty => true
+        // - true        => true
+        // - false       => continue with allowlist/official/F2P checks
+        mv.visitLdcInsn("HYTALE_TRUST_ALL_ISSUERS");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 5);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        Label trustAllContinue = new Label();
+        mv.visitJumpInsn(Opcodes.IFNONNULL, trustAllContinue);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        mv.visitLabel(trustAllContinue);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 5);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        Label trustAllIsSet = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, trustAllIsSet);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        mv.visitLabel(trustAllIsSet);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z", false);
+        Label trustAllFalse = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, trustAllFalse);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        mv.visitLabel(trustAllFalse);
+
+        // Strict mode: reject Omni-Auth tokens entirely
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, CONTEXT_CLASS, "isOmni", "()Z", false);
+        Label strictNotOmni = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, strictNotOmni);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitInsn(Opcodes.IRETURN);
+        mv.visitLabel(strictNotOmni);
+
+        // Trusted issuer allowlist: HYTALE_TRUSTED_ISSUERS=https://a,https://b
+        mv.visitLdcInsn("HYTALE_TRUSTED_ISSUERS");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 1); // trustedCsv
+
+        mv.visitVarInsn(Opcodes.ALOAD, 1);
+        Label skipTrusted = new Label();
+        mv.visitJumpInsn(Opcodes.IFNULL, skipTrusted);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 1);
+        mv.visitLdcInsn(",");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "split",
+                "(Ljava/lang/String;)[Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 2); // parts
+
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitVarInsn(Opcodes.ISTORE, 3); // i
+
+        Label loopStart = new Label();
+        Label loopCheck = new Label();
+        mv.visitLabel(loopCheck);
+        mv.visitVarInsn(Opcodes.ILOAD, 3);
+        mv.visitVarInsn(Opcodes.ALOAD, 2);
+        mv.visitInsn(Opcodes.ARRAYLENGTH);
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, skipTrusted);
+
+        mv.visitLabel(loopStart);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 2);
+        mv.visitVarInsn(Opcodes.ILOAD, 3);
+        mv.visitInsn(Opcodes.AALOAD);
+        mv.visitVarInsn(Opcodes.ASTORE, 4); // part
+
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        Label nextPart = new Label();
+        mv.visitJumpInsn(Opcodes.IFNULL, nextPart);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 4);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        mv.visitJumpInsn(Opcodes.IFNE, nextPart);
+
+        // strip trailing slash
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitLdcInsn("/");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "endsWith", "(Ljava/lang/String;)Z", false);
+        Label noSlash = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, noSlash);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitInsn(Opcodes.ICONST_0);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "length", "()I", false);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.ISUB);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "substring", "(II)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 4);
+
+        mv.visitLabel(noSlash);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitLdcInsn("://");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z",
+                false);
+        Label domainMatch = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, domainMatch);
+
+        // Full issuer URL match
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false);
+        mv.visitJumpInsn(Opcodes.IFEQ, nextPart);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        // Domain match via parsed host suffix match
+        mv.visitLabel(domainMatch);
+
+        // domain = domain.toLowerCase(); (reuse var 4)
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "toLowerCase", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 4);
+
+        // strip leading '.' if present
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitLdcInsn(".");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "startsWith", "(Ljava/lang/String;)Z", false);
+        Label noLeadingDot = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, noLeadingDot);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "substring", "(I)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 4);
+        mv.visitLabel(noLeadingDot);
+
+        // String host;
+        // try { host = new URI(issuer).getHost(); } catch (Exception e) { host = null; }
+        Label hostTryStart = new Label();
+        Label hostTryEnd = new Label();
+        Label hostCatch = new Label();
+        mv.visitTryCatchBlock(hostTryStart, hostTryEnd, hostCatch, "java/lang/Exception");
+        mv.visitLabel(hostTryStart);
+        mv.visitTypeInsn(Opcodes.NEW, "java/net/URI");
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/net/URI", "<init>", "(Ljava/lang/String;)V", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 6); // uri
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/net/URI", "getHost", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 7); // host
+        mv.visitLabel(hostTryEnd);
+        Label hostAfter = new Label();
+        mv.visitJumpInsn(Opcodes.GOTO, hostAfter);
+        mv.visitLabel(hostCatch);
+        mv.visitVarInsn(Opcodes.ASTORE, 6);
+        mv.visitInsn(Opcodes.ACONST_NULL);
+        mv.visitVarInsn(Opcodes.ASTORE, 7);
+        mv.visitLabel(hostAfter);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 7);
+        mv.visitJumpInsn(Opcodes.IFNULL, nextPart);
+
+        // host = host.toLowerCase();
+        mv.visitVarInsn(Opcodes.ALOAD, 7);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "toLowerCase", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 7);
+
+        // if (host.equals(domain)) return true;
+        mv.visitVarInsn(Opcodes.ALOAD, 7);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false);
+        Label notExactDomain = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, notExactDomain);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+        mv.visitLabel(notExactDomain);
+
+        // String suffix = "." + domain;
+        mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder");
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false);
+        mv.visitLdcInsn(".");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false);
+        mv.visitVarInsn(Opcodes.ALOAD, 4);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;",
+                false);
+        mv.visitVarInsn(Opcodes.ASTORE, 8); // suffix
+
+        // if (host.endsWith(suffix)) return true;
+        mv.visitVarInsn(Opcodes.ALOAD, 7);
+        mv.visitVarInsn(Opcodes.ALOAD, 8);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "endsWith", "(Ljava/lang/String;)Z", false);
+        mv.visitJumpInsn(Opcodes.IFEQ, nextPart);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IRETURN);
+
+        mv.visitLabel(nextPart);
+        mv.visitIincInsn(3, 1);
+        mv.visitJumpInsn(Opcodes.GOTO, loopCheck);
+
+        mv.visitLabel(skipTrusted);
+
+        // Trust official if env missing OR true
+        mv.visitLdcInsn("HYTALE_TRUST_OFFICIAL");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 5);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        Label trustOfficialDefault = new Label();
+        mv.visitJumpInsn(Opcodes.IFNULL, trustOfficialDefault);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 5);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        mv.visitJumpInsn(Opcodes.IFNE, trustOfficialDefault);
+        mv.visitVarInsn(Opcodes.ALOAD, 5);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z", false);
+        Label trustOfficialFalse = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, trustOfficialFalse);
+
+        mv.visitLabel(trustOfficialDefault);
+        // issuer contains hytale.com
         mv.visitVarInsn(Opcodes.ALOAD, 0);
         mv.visitLdcInsn("hytale.com");
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
@@ -722,7 +1040,9 @@ public class DualAuthPatcher {
         mv.visitInsn(Opcodes.ICONST_1);
         mv.visitInsn(Opcodes.IRETURN);
         mv.visitLabel(notOfficial);
-        mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+
+        mv.visitLabel(trustOfficialFalse);
+
         // Check if contains F2P base domain (sanasol.ws) for backward compatibility
         // This accepts both auth.sanasol.ws (new) and sessions.sanasol.ws (old)
         mv.visitVarInsn(Opcodes.ALOAD, 0);
@@ -730,7 +1050,7 @@ public class DualAuthPatcher {
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
                 "(Ljava/lang/CharSequence;)Z", false);
         mv.visitInsn(Opcodes.IRETURN);
-        mv.visitMaxs(2, 1);
+        mv.visitMaxs(4, 1);
         mv.visitEnd();
 
         // public static String getSessionUrl()
@@ -1488,6 +1808,8 @@ public class DualAuthPatcher {
     private static byte[] generateDualJwksFetcher() {
         ClassWriter cw = new SafeClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
 
+        MethodVisitor mv;
+
         cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL,
                 JWKS_FETCHER_CLASS, null, "java/lang/Object", null);
 
@@ -1498,8 +1820,83 @@ public class DualAuthPatcher {
         cw.visitField(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
                 "F2P_JWKS_URL", "Ljava/lang/String;", null, F2P_SESSION_URL + "/.well-known/jwks.json").visitEnd();
 
+        cw.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_VOLATILE,
+                "cachedMergedJson", "Ljava/lang/String;", null, null).visitEnd();
+        cw.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_VOLATILE,
+                "lastMergedFetchMs", "J", null, null).visitEnd();
+
+        // private static long getCacheTtlMs()
+        mv = cw.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                "getCacheTtlMs", "()J", null, null);
+        mv.visitCode();
+
+        // String raw = System.getenv("HYTALE_JWKS_CACHE_TTL");
+        mv.visitLdcInsn("HYTALE_JWKS_CACHE_TTL");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 0);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        Label ttlNotNull = new Label();
+        mv.visitJumpInsn(Opcodes.IFNONNULL, ttlNotNull);
+        mv.visitLdcInsn(3600000L);
+        mv.visitInsn(Opcodes.LRETURN);
+
+        mv.visitLabel(ttlNotNull);
+
+        // raw = raw.trim();
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 0);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        Label ttlNotEmpty = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, ttlNotEmpty);
+        mv.visitLdcInsn(3600000L);
+        mv.visitInsn(Opcodes.LRETURN);
+
+        mv.visitLabel(ttlNotEmpty);
+
+        Label tryStart = new Label();
+        Label tryEnd = new Label();
+        Label catchHandler = new Label();
+        mv.visitTryCatchBlock(tryStart, tryEnd, catchHandler, "java/lang/Exception");
+        mv.visitLabel(tryStart);
+
+        // long seconds = Long.parseLong(raw);
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Long", "parseLong", "(Ljava/lang/String;)J", false);
+        mv.visitVarInsn(Opcodes.LSTORE, 1);
+
+        // if (seconds <= 0) return 3600000L;
+        mv.visitVarInsn(Opcodes.LLOAD, 1);
+        mv.visitInsn(Opcodes.LCONST_0);
+        mv.visitInsn(Opcodes.LCMP);
+        Label ttlPositive = new Label();
+        mv.visitJumpInsn(Opcodes.IFGT, ttlPositive);
+        mv.visitLdcInsn(3600000L);
+        mv.visitInsn(Opcodes.LRETURN);
+
+        mv.visitLabel(ttlPositive);
+
+        // return seconds * 1000L;
+        mv.visitVarInsn(Opcodes.LLOAD, 1);
+        mv.visitLdcInsn(1000L);
+        mv.visitInsn(Opcodes.LMUL);
+        mv.visitLabel(tryEnd);
+        mv.visitInsn(Opcodes.LRETURN);
+
+        mv.visitLabel(catchHandler);
+        mv.visitInsn(Opcodes.POP);
+        mv.visitLdcInsn(3600000L);
+        mv.visitInsn(Opcodes.LRETURN);
+
+        mv.visitMaxs(4, 3);
+        mv.visitEnd();
+
         // Private constructor
-        MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
+        mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
         mv.visitCode();
         mv.visitVarInsn(Opcodes.ALOAD, 0);
         mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
@@ -1608,9 +2005,28 @@ public class DualAuthPatcher {
 
         // public static String fetchMergedJwksJson()
         // Fetches JWKS from both backends and merges them
-        mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNCHRONIZED,
                 "fetchMergedJwksJson", "()Ljava/lang/String;", null, null);
         mv.visitCode();
+
+        // Use cached merged json if still valid
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "currentTimeMillis", "()J", false);
+        mv.visitVarInsn(Opcodes.LSTORE, 2); // now
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "getCacheTtlMs", "()J", false);
+        mv.visitVarInsn(Opcodes.LSTORE, 4); // ttlMs
+        mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "cachedMergedJson", "Ljava/lang/String;");
+        Label cacheMiss = new Label();
+        mv.visitJumpInsn(Opcodes.IFNULL, cacheMiss);
+        mv.visitVarInsn(Opcodes.LLOAD, 2);
+        mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "lastMergedFetchMs", "J");
+        mv.visitInsn(Opcodes.LSUB);
+        mv.visitVarInsn(Opcodes.LLOAD, 4);
+        mv.visitInsn(Opcodes.LCMP);
+        mv.visitJumpInsn(Opcodes.IFGE, cacheMiss);
+        mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "cachedMergedJson", "Ljava/lang/String;");
+        mv.visitInsn(Opcodes.ARETURN);
+
+        mv.visitLabel(cacheMiss);
 
         // Print detailed log message with configured URLs
         mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
@@ -1642,10 +2058,41 @@ public class DualAuthPatcher {
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false);
 
         // String officialJson = fetchJwksJson(OFFICIAL_JWKS_URL);
+        // Trust official if env missing OR true
+        mv.visitLdcInsn("HYTALE_TRUST_OFFICIAL");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 6);
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        Label fetchOfficial = new Label();
+        mv.visitJumpInsn(Opcodes.IFNULL, fetchOfficial);
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 6);
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        mv.visitJumpInsn(Opcodes.IFNE, fetchOfficial);
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z", false);
+        Label skipOfficial = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, skipOfficial);
+
+        mv.visitLabel(fetchOfficial);
         mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "OFFICIAL_JWKS_URL", "Ljava/lang/String;");
         mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "fetchJwksJson",
                 "(Ljava/lang/String;)Ljava/lang/String;", false);
         mv.visitVarInsn(Opcodes.ASTORE, 0);
+        Label afterOfficial = new Label();
+        mv.visitJumpInsn(Opcodes.GOTO, afterOfficial);
+
+        mv.visitLabel(skipOfficial);
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+        mv.visitLdcInsn("[DualAuth] Official JWKS disabled (HYTALE_TRUST_OFFICIAL=false)");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false);
+        mv.visitInsn(Opcodes.ACONST_NULL);
+        mv.visitVarInsn(Opcodes.ASTORE, 0);
+
+        mv.visitLabel(afterOfficial);
 
         // String f2pJson = fetchJwksJson(F2P_JWKS_URL);
         mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "F2P_JWKS_URL", "Ljava/lang/String;");
@@ -1708,9 +2155,20 @@ public class DualAuthPatcher {
         mv.visitVarInsn(Opcodes.ALOAD, 1);
         mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "mergeJwks",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 6);
+
+        // Update cache
+        mv.visitFieldInsn(Opcodes.GETSTATIC, JWKS_FETCHER_CLASS, "cachedMergedJson", "Ljava/lang/String;");
+        mv.visitInsn(Opcodes.POP);
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
+        mv.visitFieldInsn(Opcodes.PUTSTATIC, JWKS_FETCHER_CLASS, "cachedMergedJson", "Ljava/lang/String;");
+        mv.visitVarInsn(Opcodes.LLOAD, 2);
+        mv.visitFieldInsn(Opcodes.PUTSTATIC, JWKS_FETCHER_CLASS, "lastMergedFetchMs", "J");
+
+        mv.visitVarInsn(Opcodes.ALOAD, 6);
         mv.visitInsn(Opcodes.ARETURN);
 
-        mv.visitMaxs(5, 2);
+        mv.visitMaxs(5, 5);
         mv.visitEnd();
 
         // public static String mergeJwks(String json1, String json2)
@@ -3982,6 +4440,50 @@ public class DualAuthPatcher {
         mv.visitLdcInsn("[DualAuth] Detected embedded PRIVATE KEY (Omni-Auth). Executing bypass verification...");
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false);
 
+        mv.visitLdcInsn("HYTALE_TRUST_ALL_ISSUERS");
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "getenv",
+                "(Ljava/lang/String;)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 15);
+        Label allowOmniBypass = new Label();
+        mv.visitVarInsn(Opcodes.ALOAD, 15);
+        mv.visitJumpInsn(Opcodes.IFNULL, allowOmniBypass);
+        mv.visitVarInsn(Opcodes.ALOAD, 15);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 15);
+        mv.visitVarInsn(Opcodes.ALOAD, 15);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
+        mv.visitJumpInsn(Opcodes.IFNE, allowOmniBypass);
+        mv.visitVarInsn(Opcodes.ALOAD, 15);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z", false);
+        mv.visitJumpInsn(Opcodes.IFNE, allowOmniBypass);
+
+        mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+        mv.visitLdcInsn("[DualAuth] Omni-Auth rejected (HYTALE_TRUST_ALL_ISSUERS=false)");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false);
+
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IADD);
+        mv.visitVarInsn(Opcodes.ILOAD, 2);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "substring", "(II)Ljava/lang/String;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 11);
+
+        mv.visitTypeInsn(Opcodes.NEW, "com/nimbusds/jose/util/Base64URL");
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitVarInsn(Opcodes.ALOAD, 11);
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "com/nimbusds/jose/util/Base64URL", "<init>", "(Ljava/lang/String;)V",
+                false);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "com/nimbusds/jose/util/Base64URL", "decodeToString",
+                "()Ljava/lang/String;", false);
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, "com/nimbusds/jwt/JWTClaimsSet", "parse",
+                "(Ljava/lang/String;)Lcom/nimbusds/jwt/JWTClaimsSet;", false);
+        mv.visitVarInsn(Opcodes.ASTORE, 14);
+        mv.visitVarInsn(Opcodes.ALOAD, 14);
+        mv.visitInsn(Opcodes.ARETURN);
+
+        mv.visitLabel(allowOmniBypass);
+
         // Reconstruct SAFE public header for verification
         // JWSHeader safeHeader = new
         // JWSHeader.Builder(JWSAlgorithm.EdDSA).jwk(keyPair.toPublicJWK()).build();
@@ -4463,6 +4965,10 @@ public class DualAuthPatcher {
                 if (returnType.getSort() == Type.OBJECT) {
                     System.out.println("  [JWTValidator] Patching " + mn.name + " with wrapper " + wrapperInternalName);
 
+                    int claimsVar = mn.maxLocals;
+                    int envVar = claimsVar + 1;
+                    mn.maxLocals = envVar + 1;
+
                     InsnList hook = new InsnList();
 
                     // 1. Call EmbeddedJwkVerifier.verifyAndGetClaims(token)
@@ -4500,11 +5006,59 @@ public class DualAuthPatcher {
                     // Stack: [JWTClaimsSet]
 
                     // Store JWTClaimsSet temporarily
-                    hook.add(new VarInsnNode(Opcodes.ASTORE, 2)); // Store claims in var 2
+                    hook.add(new VarInsnNode(Opcodes.ASTORE, claimsVar));
 
-                    // Reset Omni-Auth state to prevent cross-contamination between connections
+                    // Enforce HYTALE_TRUST_ALL_ISSUERS for Omni-Auth bypass:
+                    // - unset/empty/true => allow Omni bypass
+                    // - false            => do NOT bypass (continue standard flow so it gets rejected)
+                    hook.add(new LdcInsnNode("HYTALE_TRUST_ALL_ISSUERS"));
+                    hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                            "java/lang/System",
+                            "getenv",
+                            "(Ljava/lang/String;)Ljava/lang/String;",
+                            false));
+                    hook.add(new VarInsnNode(Opcodes.ASTORE, envVar));
+
+                    LabelNode allowOmni = new LabelNode();
+                    LabelNode strictOmni = new LabelNode();
+                    LabelNode afterOmniDecision = new LabelNode();
+
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, envVar));
+                    hook.add(new JumpInsnNode(Opcodes.IFNULL, allowOmni));
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, envVar));
+                    hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                            "java/lang/String",
+                            "trim",
+                            "()Ljava/lang/String;",
+                            false));
+                    hook.add(new VarInsnNode(Opcodes.ASTORE, envVar));
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, envVar));
+                    hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                            "java/lang/String",
+                            "isEmpty",
+                            "()Z",
+                            false));
+                    hook.add(new JumpInsnNode(Opcodes.IFNE, allowOmni));
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, envVar));
+                    hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                            "java/lang/Boolean",
+                            "parseBoolean",
+                            "(Ljava/lang/String;)Z",
+                            false));
+                    hook.add(new JumpInsnNode(Opcodes.IFEQ, strictOmni));
+
+                    hook.add(allowOmni);
+                    hook.add(new InsnNode(Opcodes.ICONST_1));
+                    hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC, CONTEXT_CLASS, "setOmni", "(Z)V", false));
+                    hook.add(new JumpInsnNode(Opcodes.GOTO, afterOmniDecision));
+
+                    hook.add(strictOmni);
                     hook.add(new InsnNode(Opcodes.ICONST_0));
                     hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC, CONTEXT_CLASS, "setOmni", "(Z)V", false));
+                    hook.add(new InsnNode(Opcodes.ACONST_NULL));
+                    hook.add(new InsnNode(Opcodes.ARETURN));
+
+                    hook.add(afterOmniDecision);
 
                     // Create wrapper instance using the original pattern: new + init() + putfield
                     hook.add(new TypeInsnNode(Opcodes.NEW, wrapperInternalName));
@@ -4524,7 +5078,7 @@ public class DualAuthPatcher {
 
                     // Set issuer field
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper for field setting
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims from var 2
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getIssuer",
@@ -4534,7 +5088,7 @@ public class DualAuthPatcher {
 
                     // Set subject field
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getSubject",
@@ -4544,7 +5098,7 @@ public class DualAuthPatcher {
 
                     // Set issuedAt field (with null check like original)
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getIssueTime",
@@ -4553,7 +5107,7 @@ public class DualAuthPatcher {
                     LabelNode issuedAtNull = new LabelNode();
                     hook.add(new JumpInsnNode(Opcodes.IFNULL, issuedAtNull));
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getIssueTime",
@@ -4586,7 +5140,7 @@ public class DualAuthPatcher {
 
                     // Set expiresAt field (with null check)
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getExpirationTime",
@@ -4595,7 +5149,7 @@ public class DualAuthPatcher {
                     LabelNode expiresAtNull = new LabelNode();
                     hook.add(new JumpInsnNode(Opcodes.IFNULL, expiresAtNull));
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getExpirationTime",
@@ -4628,7 +5182,7 @@ public class DualAuthPatcher {
 
                     // Set notBefore field (with null check)
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getNotBeforeTime",
@@ -4637,7 +5191,7 @@ public class DualAuthPatcher {
                     LabelNode notBeforeNull = new LabelNode();
                     hook.add(new JumpInsnNode(Opcodes.IFNULL, notBeforeNull));
                     hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                    hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                    hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                     hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                             "com/nimbusds/jwt/JWTClaimsSet",
                             "getNotBeforeTime",
@@ -4673,7 +5227,7 @@ public class DualAuthPatcher {
                     if (wrapperInternalName.contains("JWTClaims")
                             || wrapperInternalName.contains("IdentityTokenClaims")) {
                         hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                        hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claimsSet
+                        hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                         hook.add(new LdcInsnNode("username"));
                         hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                                 "com/nimbusds/jwt/JWTClaimsSet",
@@ -4688,7 +5242,7 @@ public class DualAuthPatcher {
                     if (wrapperInternalName.contains("JWTClaims")) {
                         // JWTClaims has additional fields: audience
                         hook.add(new InsnNode(Opcodes.DUP)); // Duplicate wrapper
-                        hook.add(new VarInsnNode(Opcodes.ALOAD, 2)); // Load claims
+                        hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                         hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                                 "com/nimbusds/jwt/JWTClaimsSet",
                                 "getAudience",
@@ -4705,7 +5259,7 @@ public class DualAuthPatcher {
                             || wrapperInternalName.contains("IdentityTokenClaims")) {
                         // populated standard scope for both SessionTokenClaims and IdentityTokenClaims
                         hook.add(new InsnNode(Opcodes.DUP));
-                        hook.add(new VarInsnNode(Opcodes.ALOAD, 2));
+                        hook.add(new VarInsnNode(Opcodes.ALOAD, claimsVar));
                         hook.add(new LdcInsnNode("scope"));
                         hook.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                                 "com/nimbusds/jwt/JWTClaimsSet",
