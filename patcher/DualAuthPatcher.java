@@ -2520,7 +2520,7 @@ public class DualAuthPatcher {
 
                 // Helper: extractKeysContent(String json) -> Returns inner string inside
                 // "keys": [...]
-                mv = cw.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC, "extractKeysContent",
+                mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "extractKeysContent",
                                 "(Ljava/lang/String;)Ljava/lang/String;", null, null);
                 mv.visitCode();
                 // find "keys":
