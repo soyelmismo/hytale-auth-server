@@ -712,7 +712,6 @@ public class DualAuthPatcher {
                 mv.visitInsn(Opcodes.ICONST_0);
                 mv.visitInsn(Opcodes.IRETURN);
                 mv.visitLabel(notNull);
-                mv.visitFrame(Opcodes.F_APPEND, 1, new Object[] { "java/lang/String" }, 0, null);
                 // True only for Sanasol issuers
                 mv.visitVarInsn(Opcodes.ALOAD, 0);
                 mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_BASE_DOMAIN", "Ljava/lang/String;");
@@ -723,7 +722,6 @@ public class DualAuthPatcher {
                 mv.visitInsn(Opcodes.ICONST_1);
                 mv.visitInsn(Opcodes.IRETURN);
                 mv.visitLabel(returnFalse);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
                 mv.visitInsn(Opcodes.ICONST_0);
                 mv.visitInsn(Opcodes.IRETURN);
                 mv.visitMaxs(2, 1);
@@ -2031,7 +2029,6 @@ public class DualAuthPatcher {
         mv.visitLdcInsn("");
         mv.visitInsn(Opcodes.ARETURN);
         mv.visitLabel(nullCheck);
-        mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
         // int idx = json.indexOf("\"keys\":");
         mv.visitVarInsn(Opcodes.ALOAD, 0);
@@ -2508,7 +2505,6 @@ public class DualAuthPatcher {
                 mv.visitInsn(Opcodes.ARETURN);
 
                 mv.visitLabel(fetchNew);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
                 // Try to fetch new identity
                 mv.visitMethodInsn(Opcodes.INVOKESTATIC, SERVER_IDENTITY_CLASS, "fetchF2PServerIdentity", "()V", false);
@@ -2535,7 +2531,6 @@ public class DualAuthPatcher {
                 mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_URL", "Ljava/lang/String;");
                 mv.visitVarInsn(Opcodes.ASTORE, 0);
                 mv.visitLabel(urlNotNull);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
                 // return fetchIdentityFromUrl(baseUrl);
                 mv.visitVarInsn(Opcodes.ALOAD, 0);
@@ -2733,14 +2728,9 @@ public class DualAuthPatcher {
 
                 // } // end if identityToken found
                 mv.visitLabel(noIdentityToken);
-                mv.visitFrame(Opcodes.F_APPEND, 6, new Object[] { "java/net/http/HttpClient", "java/lang/String",
-                                "java/lang/String", "java/net/http/HttpRequest", "java/net/http/HttpResponse",
-                                "java/lang/String" }, 0,
-                                null);
 
                 // } // end if status 200
                 mv.visitLabel(notOk);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
                 mv.visitLabel(tryEnd);
                 Label afterCatch = new Label();
@@ -2748,7 +2738,6 @@ public class DualAuthPatcher {
 
                 // CATCH BLOCK: Fallback to local self-signed token generation
                 mv.visitLabel(catchBlock);
-                mv.visitFrame(Opcodes.F_SAME1, 0, null, 1, new Object[] { "java/lang/Exception" });
                 mv.visitVarInsn(Opcodes.ASTORE, 9); // exception
 
                 // Log fallback
@@ -2762,7 +2751,6 @@ public class DualAuthPatcher {
                 mv.visitMethodInsn(Opcodes.INVOKESTATIC, SERVER_IDENTITY_CLASS, "generateLocalToken", "()V", false);
 
                 mv.visitLabel(afterCatch);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
                 mv.visitInsn(Opcodes.RETURN);
                 mv.visitMaxs(5, 10);
                 mv.visitEnd();
@@ -2786,7 +2774,6 @@ public class DualAuthPatcher {
                 mv.visitInsn(Opcodes.ARETURN);
 
                 mv.visitLabel(noEnv);
-                mv.visitFrame(Opcodes.F_APPEND, 1, new Object[] { "java/lang/String" }, 0, null);
 
                 // Generate a random UUID if not set
                 mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/util/UUID", "randomUUID", "()Ljava/util/UUID;", false);
@@ -2977,7 +2964,6 @@ public class DualAuthPatcher {
                 mv.visitJumpInsn(Opcodes.GOTO, afterLocalCatch);
 
                 mv.visitLabel(tCatch);
-                mv.visitFrame(Opcodes.F_SAME1, 0, null, 1, new Object[] { "java/lang/Exception" });
                 mv.visitVarInsn(Opcodes.ASTORE, 8);
                 // Log exception
                 mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "err", "Ljava/io/PrintStream;");
@@ -2988,7 +2974,6 @@ public class DualAuthPatcher {
                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Exception", "printStackTrace", "()V", false);
 
                 mv.visitLabel(afterLocalCatch);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
                 mv.visitInsn(Opcodes.RETURN);
                 mv.visitMaxs(5, 9);
                 mv.visitEnd();
@@ -5005,10 +4990,6 @@ public class DualAuthPatcher {
 
                 // STANDARD PARSE FALLBACK (Official Tokens or Public keys)
                 mv.visitLabel(standardParse);
-                mv.visitFrame(Opcodes.F_FULL, 6,
-                                new Object[] { "java/lang/String", Opcodes.INTEGER, Opcodes.INTEGER, "java/lang/String",
-                                                "java/lang/String", "java/util/Map" },
-                                0, null);
 
                 // Standard tokens: normally return null to let server validate via JWKS.
                 // BUT: Omni-Auth access tokens don't include embedded private JWK headers; they
@@ -5160,8 +5141,6 @@ public class DualAuthPatcher {
                 mv.visitInsn(Opcodes.ARETURN);
 
                 mv.visitLabel(catchLabel);
-                mv.visitFrame(Opcodes.F_FULL, 1, new Object[] { "java/lang/String" }, 1,
-                                new Object[] { "java/lang/Exception" });
                 mv.visitVarInsn(Opcodes.ASTORE, 12);
                 mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
                 mv.visitLdcInsn("[DualAuth] Error in manual token verification: ");
@@ -7082,24 +7061,33 @@ public class DualAuthPatcher {
                                 if (mi.owner.equals("java/util/concurrent/atomic/AtomicReference") &&
                                                 mi.name.equals("set")) {
 
-                                        // We want to capture the value being set.
-                                        // The stack before 'set' is [AtomicReference, Value]
-                                        // We want to insert:
-                                        // DUP (copies Value)
-                                        // INVOKESTATIC DualServerTokenManager.captureNativeSession(Value)
+                                        // Scan backwards for GETFIELD to ensure it's 'gameSession'
+                                        AbstractInsnNode prev = insn.getPrevious();
+                                        boolean targetFound = false;
+                                        int steps = 0;
+                                        while (prev != null && steps < 20) { // Limit scan
+                                                if (prev.getOpcode() == Opcodes.GETFIELD) {
+                                                        FieldInsnNode fi = (FieldInsnNode) prev;
+                                                        if (fi.name.equals("gameSession")) {
+                                                                targetFound = true;
+                                                        }
+                                                        break;
+                                                }
+                                                prev = prev.getPrevious();
+                                                steps++;
+                                        }
 
-                                        // Note: DUP only works if Value is 1 slot. GameSessionResponse is an object, so
-                                        // 1 slot.
+                                        if (targetFound) {
+                                                InsnList hook = new InsnList();
+                                                hook.add(new InsnNode(Opcodes.DUP));
+                                                hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                                                TOKEN_MANAGER_CLASS, "captureNativeSession",
+                                                                "(Ljava/lang/Object;)V", false));
 
-                                        InsnList hook = new InsnList();
-                                        hook.add(new InsnNode(Opcodes.DUP));
-                                        hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                                                        TOKEN_MANAGER_CLASS, "captureNativeSession",
-                                                        "(Ljava/lang/Object;)V", false));
-
-                                        insns.insertBefore(insn, hook);
-                                        patched = true;
-                                        patchCount++;
+                                                insns.insertBefore(insn, hook);
+                                                patched = true;
+                                                patchCount++;
+                                        }
                                 }
                         }
                 }
