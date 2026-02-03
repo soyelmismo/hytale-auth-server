@@ -673,6 +673,7 @@ jobs:
           echo "Using isolated data directory: universe_strict"
 
           echo "Starting Hytale server with HYTALE_TRUST_ALL_ISSUERS=false (strict mode)..."
+          echo "Note: No CLI tokens - server will auto-fetch F2P tokens only"
           HYTALE_TRUST_ALL_ISSUERS=false \
           java -Xmx2G \
             -jar HytaleServerPatched.jar \
@@ -681,8 +682,6 @@ jobs:
             --universe universe_strict \
             --auth-mode authenticated \
             --disable-sentry \
-            --session-token "$SESSION_TOKEN" \
-            --identity-token "$IDENTITY_TOKEN" \
             2>&1 | tee server_strict.log &
 
           SERVER_PID=$!
@@ -796,6 +795,7 @@ jobs:
           echo "Using isolated data directory: universe_trusted"
 
           echo "Starting Hytale server with HYTALE_TRUST_ALL_ISSUERS=false and HYTALE_TRUSTED_ISSUERS=127.0.0.1..."
+          echo "Note: No CLI tokens - server will auto-fetch F2P tokens only"
           HYTALE_TRUST_ALL_ISSUERS=false \
           HYTALE_TRUSTED_ISSUERS="127.0.0.1,localhost" \
           java -Xmx2G \
@@ -805,8 +805,6 @@ jobs:
             --universe universe_trusted \
             --auth-mode authenticated \
             --disable-sentry \
-            --session-token "$SESSION_TOKEN" \
-            --identity-token "$IDENTITY_TOKEN" \
             2>&1 | tee server_trusted.log &
 
           SERVER_PID=$!
