@@ -1806,12 +1806,12 @@ public class DualAuthPatcher {
 
         // If issuer is null, return false
         mv.visitVarInsn(Opcodes.ALOAD, 0);
-        Label issuerNotNull = new Label();
-        mv.visitJumpInsn(Opcodes.IFNONNULL, issuerNotNull);
+        Label omniIssuerNotNull = new Label();
+        mv.visitJumpInsn(Opcodes.IFNONNULL, omniIssuerNotNull);
         mv.visitInsn(Opcodes.ICONST_0);
         mv.visitInsn(Opcodes.IRETURN);
 
-        mv.visitLabel(issuerNotNull);
+        mv.visitLabel(omniIssuerNotNull);
 
         // Get TRUSTED_ISSUERS env
         mv.visitLdcInsn("HYTALE_TRUSTED_ISSUERS");
@@ -1856,13 +1856,13 @@ public class DualAuthPatcher {
         mv.visitInsn(Opcodes.ICONST_0);
         mv.visitVarInsn(Opcodes.ISTORE, 4); // i = 0
 
-        Label loopCheck = new Label();
-        Label loopBody = new Label();
-        Label returnFalse = new Label();
+        Label omniLoopCheck = new Label();
+        Label omniLoopBody = new Label();
+        Label omniReturnFalse = new Label();
 
-        mv.visitJumpInsn(Opcodes.GOTO, loopCheck);
+        mv.visitJumpInsn(Opcodes.GOTO, omniLoopCheck);
 
-        mv.visitLabel(loopBody);
+        mv.visitLabel(omniLoopBody);
         // part = parts[i].trim().toLowerCase()
         mv.visitVarInsn(Opcodes.ALOAD, 3);
         mv.visitVarInsn(Opcodes.ILOAD, 4);
@@ -1870,11 +1870,12 @@ public class DualAuthPatcher {
         mv.visitVarInsn(Opcodes.ASTORE, 5); // part
 
         mv.visitVarInsn(Opcodes.ALOAD, 5);
-        Label partNotNull = new Label();
-        mv.visitJumpInsn(Opcodes.IFNONNULL, partNotNull);
-        mv.visitJumpInsn(Opcodes.GOTO, returnFalse); // Skip null parts - continue to next
+        Label omniPartNotNull = new Label();
+        mv.visitJumpInsn(Opcodes.IFNONNULL, omniPartNotNull);
+        mv.visitIincInsn(4, 1); // i++ - skip null parts
+        mv.visitJumpInsn(Opcodes.GOTO, omniLoopCheck);
 
-        mv.visitLabel(partNotNull);
+        mv.visitLabel(omniPartNotNull);
         mv.visitVarInsn(Opcodes.ALOAD, 5);
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;", false);
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "toLowerCase", "()Ljava/lang/String;", false);
@@ -1882,12 +1883,12 @@ public class DualAuthPatcher {
 
         mv.visitVarInsn(Opcodes.ALOAD, 5);
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "isEmpty", "()Z", false);
-        Label partNotEmpty = new Label();
-        mv.visitJumpInsn(Opcodes.IFEQ, partNotEmpty);
+        Label omniPartNotEmpty = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, omniPartNotEmpty);
         mv.visitIincInsn(4, 1);
-        mv.visitJumpInsn(Opcodes.GOTO, loopCheck);
+        mv.visitJumpInsn(Opcodes.GOTO, omniLoopCheck);
 
-        mv.visitLabel(partNotEmpty);
+        mv.visitLabel(omniPartNotEmpty);
 
         // Check if issuer contains the trusted part (host match)
         // e.g., "http://127.0.0.1:12345" contains "127.0.0.1"
@@ -1895,8 +1896,8 @@ public class DualAuthPatcher {
         mv.visitVarInsn(Opcodes.ALOAD, 5); // part
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
                 "(Ljava/lang/CharSequence;)Z", false);
-        Label noMatch = new Label();
-        mv.visitJumpInsn(Opcodes.IFEQ, noMatch);
+        Label omniNoMatch = new Label();
+        mv.visitJumpInsn(Opcodes.IFEQ, omniNoMatch);
 
         // Match found! Log and return true
         mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
@@ -1921,17 +1922,17 @@ public class DualAuthPatcher {
         mv.visitInsn(Opcodes.ICONST_1);
         mv.visitInsn(Opcodes.IRETURN);
 
-        mv.visitLabel(noMatch);
+        mv.visitLabel(omniNoMatch);
         mv.visitIincInsn(4, 1); // i++
 
-        mv.visitLabel(loopCheck);
+        mv.visitLabel(omniLoopCheck);
         mv.visitVarInsn(Opcodes.ILOAD, 4); // i
         mv.visitVarInsn(Opcodes.ALOAD, 3); // parts
         mv.visitInsn(Opcodes.ARRAYLENGTH);
-        mv.visitJumpInsn(Opcodes.IF_ICMPLT, loopBody);
+        mv.visitJumpInsn(Opcodes.IF_ICMPLT, omniLoopBody);
 
         // No match found
-        mv.visitLabel(returnFalse);
+        mv.visitLabel(omniReturnFalse);
         mv.visitInsn(Opcodes.ICONST_0);
         mv.visitInsn(Opcodes.IRETURN);
 
