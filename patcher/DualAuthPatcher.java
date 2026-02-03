@@ -2757,7 +2757,7 @@ public class DualAuthPatcher {
 
                 // private static String getServerUuid()
                 // Returns the server's UUID (from AuthConfig or generates one)
-                mv = cw.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                                 "getServerUuid", "()Ljava/lang/String;", null, null);
                 mv.visitCode();
 
