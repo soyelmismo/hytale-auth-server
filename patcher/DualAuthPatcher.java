@@ -3911,7 +3911,35 @@ public class DualAuthPatcher {
                 mv.visitLabel(notOfficialLabel);
                 mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
-                // 4. Omni-Auth Check (WITH JWK SAFETY CHECK)
+                // --- MOVED UP: 4. Configured F2P Check / "Sanasol" Check / Base Domain Check ---
+                mv.visitVarInsn(Opcodes.ALOAD, 0);
+                mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_BASE_DOMAIN", "Ljava/lang/String;");
+                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
+                                "(Ljava/lang/CharSequence;)Z", false);
+                Label checkOmniLabel = new Label(); // Jump to Omni check if NOT F2P
+                mv.visitJumpInsn(Opcodes.IFEQ, checkOmniLabel);
+
+                // It IS F2P. Return token (with lazy load)
+                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pSessionToken", "Ljava/lang/String;");
+                mv.visitVarInsn(Opcodes.ASTORE, 1);
+                mv.visitVarInsn(Opcodes.ALOAD, 1);
+                Label hasF2pToken = new Label();
+                mv.visitJumpInsn(Opcodes.IFNONNULL, hasF2pToken);
+
+                // Lazy load if missing
+                mv.visitMethodInsn(Opcodes.INVOKESTATIC, TOKEN_MANAGER_CLASS, "ensureF2PTokens", "()V", false);
+                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pSessionToken", "Ljava/lang/String;");
+                mv.visitInsn(Opcodes.ARETURN);
+
+                mv.visitLabel(hasF2pToken);
+                mv.visitFrame(Opcodes.F_APPEND, 1, new Object[] { "java/lang/String" }, 0, null);
+                mv.visitVarInsn(Opcodes.ALOAD, 1);
+                mv.visitInsn(Opcodes.ARETURN);
+
+                mv.visitLabel(checkOmniLabel);
+                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+
+                // 5. Omni-Auth Check (WITH JWK SAFETY CHECK)
                 mv.visitMethodInsn(Opcodes.INVOKESTATIC, CONTEXT_CLASS, "isOmni", "()Z", false);
                 Label notOmniLabel = new Label();
                 mv.visitJumpInsn(Opcodes.IFEQ, notOmniLabel);
@@ -3930,24 +3958,11 @@ public class DualAuthPatcher {
                 mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
                 // Log warning about false positive
                 mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
-                mv.visitLdcInsn("[DualAuth] Warning: Omni flag true but no JWK found. Proceeding to F2P fallback.");
+                mv.visitLdcInsn("[DualAuth] Warning: Omni flag true but no JWK found. Proceeding to Dynamic/F2P fallback.");
                 mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V",
                                 false);
 
                 mv.visitLabel(notOmniLabel);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
-
-                // 5. Configured F2P Check / "Sanasol" Check / Base Domain Check
-                mv.visitVarInsn(Opcodes.ALOAD, 0);
-                mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_BASE_DOMAIN", "Ljava/lang/String;");
-                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
-                                "(Ljava/lang/CharSequence;)Z", false);
-                Label checkCacheLabel = new Label();
-                mv.visitJumpInsn(Opcodes.IFEQ, checkCacheLabel); // If not base domain, try dynamic cache
-                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pSessionToken", "Ljava/lang/String;");
-                mv.visitInsn(Opcodes.ARETURN);
-
-                mv.visitLabel(checkCacheLabel);
                 mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
                 // 6. Dynamic/Unknown -> Try Fetch, but FALLBACK to F2P if fetch fails
@@ -4171,7 +4186,35 @@ public class DualAuthPatcher {
                 mv.visitLabel(idNotOfficialLabel);
                 mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
-                // 4. Omni-Auth Check (WITH JWK SAFETY)
+                // --- MOVED UP: 4. Configured F2P Check ---
+                mv.visitVarInsn(Opcodes.ALOAD, 0);
+                mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_BASE_DOMAIN", "Ljava/lang/String;");
+                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
+                                "(Ljava/lang/CharSequence;)Z", false);
+                Label idCheckOmniLabel = new Label();
+                mv.visitJumpInsn(Opcodes.IFEQ, idCheckOmniLabel);
+
+                // It IS F2P. Return token (with lazy load)
+                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pIdentityToken", "Ljava/lang/String;");
+                mv.visitVarInsn(Opcodes.ASTORE, 1);
+                mv.visitVarInsn(Opcodes.ALOAD, 1);
+                Label hasF2pIdToken = new Label();
+                mv.visitJumpInsn(Opcodes.IFNONNULL, hasF2pIdToken);
+
+                // Lazy load if missing
+                mv.visitMethodInsn(Opcodes.INVOKESTATIC, TOKEN_MANAGER_CLASS, "ensureF2PTokens", "()V", false);
+                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pIdentityToken", "Ljava/lang/String;");
+                mv.visitInsn(Opcodes.ARETURN);
+
+                mv.visitLabel(hasF2pIdToken);
+                mv.visitFrame(Opcodes.F_APPEND, 1, new Object[] { "java/lang/String" }, 0, null);
+                mv.visitVarInsn(Opcodes.ALOAD, 1);
+                mv.visitInsn(Opcodes.ARETURN);
+
+                mv.visitLabel(idCheckOmniLabel);
+                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+
+                // 5. Omni-Auth Check (WITH JWK SAFETY)
                 mv.visitMethodInsn(Opcodes.INVOKESTATIC, CONTEXT_CLASS, "isOmni", "()Z", false);
                 Label idNotOmniLabel = new Label();
                 mv.visitJumpInsn(Opcodes.IFEQ, idNotOmniLabel);
@@ -4192,25 +4235,12 @@ public class DualAuthPatcher {
                 mv.visitLabel(idNotOmniLabel);
                 mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
 
-                // 5. Configured F2P Check
-                mv.visitVarInsn(Opcodes.ALOAD, 0);
-                mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_BASE_DOMAIN", "Ljava/lang/String;");
-                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "contains",
-                                "(Ljava/lang/CharSequence;)Z", false);
-                Label idCheckSelfSignLabel = new Label();
-                mv.visitJumpInsn(Opcodes.IFEQ, idCheckSelfSignLabel);
-                mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pIdentityToken", "Ljava/lang/String;");
-                mv.visitInsn(Opcodes.ARETURN);
-
-                mv.visitLabel(idCheckSelfSignLabel);
-                mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
-
                 // 6. HARD FALLBACK: Return F2P token instead of generating self-signed garbage
                 // or returning null
                 mv.visitFieldInsn(Opcodes.GETSTATIC, TOKEN_MANAGER_CLASS, "f2pIdentityToken", "Ljava/lang/String;");
                 mv.visitInsn(Opcodes.ARETURN);
 
-                mv.visitMaxs(3, 1);
+                mv.visitMaxs(3, 2);
                 mv.visitEnd();
 
                 // public static boolean hasOfficialTokens()
@@ -6503,6 +6533,11 @@ public class DualAuthPatcher {
                                                 replacement.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                                                                 CONTEXT_CLASS, "setIssuer", "(Ljava/lang/String;)V",
                                                                 false));
+
+                                                // --- FIX: Explicitly clear Omni flag for new connection ---
+                                                replacement.add(new InsnNode(Opcodes.ICONST_0));
+                                                replacement.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                                                CONTEXT_CLASS, "setOmni", "(Z)V", false));
                                         } else {
                                                 replacement.add(new InsnNode(Opcodes.ACONST_NULL));
                                         }
@@ -6541,6 +6576,11 @@ public class DualAuthPatcher {
                                                 wrap.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                                                                 CONTEXT_CLASS, "setIssuer", "(Ljava/lang/String;)V",
                                                                 false));
+
+                                                // --- FIX: Explicitly clear Omni flag for new connection ---
+                                                wrap.add(new InsnNode(Opcodes.ICONST_0));
+                                                wrap.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                                                CONTEXT_CLASS, "setOmni", "(Z)V", false));
                                         } else {
                                                 wrap.add(new InsnNode(Opcodes.ACONST_NULL));
                                         }
