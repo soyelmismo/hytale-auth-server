@@ -4114,16 +4114,37 @@ public class DualAuthPatcher {
                 cw.visitField(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                                 "OFFICIAL_AUTH_URL", "Ljava/lang/String;", null, null).visitEnd();
 
-                // Static Initializer (<clinit>)
+                // --- MERGED STATIC INITIALIZER (<clinit>) ---
                 mv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
                 mv.visitCode();
+
+                // 1. Initialize Constants (Original First Block)
                 mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "F2P_URL", "Ljava/lang/String;");
                 mv.visitFieldInsn(Opcodes.PUTSTATIC, TOKEN_MANAGER_CLASS, "F2P_AUTH_URL", "Ljava/lang/String;");
                 mv.visitFieldInsn(Opcodes.GETSTATIC, HELPER_CLASS, "OFFICIAL_URL", "Ljava/lang/String;");
                 mv.visitFieldInsn(Opcodes.PUTSTATIC, TOKEN_MANAGER_CLASS, "OFFICIAL_AUTH_URL", "Ljava/lang/String;");
+
+                // 2. Perform Synchronous Fetch (Original Second Block)
+                // Log start
+                mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+                mv.visitLdcInsn("[DualAuth] DualServerTokenManager static init - starting synchronous F2P token fetch");
+                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V",
+                                false);
+
+                // Call ensureF2PTokens() synchronously
+                // This will fetch tokens immediately during class loading
+                mv.visitMethodInsn(Opcodes.INVOKESTATIC, TOKEN_MANAGER_CLASS, "ensureF2PTokens", "()V", false);
+
+                // Log completion
+                mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
+                mv.visitLdcInsn("[DualAuth] F2P token fetch completed during static initialization");
+                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V",
+                                false);
+
                 mv.visitInsn(Opcodes.RETURN);
-                mv.visitMaxs(1, 0);
+                mv.visitMaxs(2, 0); // Updated max stack for println
                 mv.visitEnd();
+                // ---------------------------------------------
 
                 // Private constructor
                 mv = cw.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
@@ -4874,31 +4895,7 @@ public class DualAuthPatcher {
                 mv.visitMaxs(4, 0);
                 mv.visitEnd();
 
-                // Static initializer to auto-fetch F2P tokens on server startup
-                // MODIFIED: Synchronous fetch instead of background thread
-                mv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
-                mv.visitCode();
-
-                // System.out.println("[DualAuth] DualServerTokenManager static init - starting
-                // synchronous F2P token fetch");
-                mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
-                mv.visitLdcInsn("[DualAuth] DualServerTokenManager static init - starting synchronous F2P token fetch");
-                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V",
-                                false);
-
-                // Call ensureF2PTokens() synchronously
-                // This will fetch tokens immediately during class loading
-                mv.visitMethodInsn(Opcodes.INVOKESTATIC, TOKEN_MANAGER_CLASS, "ensureF2PTokens", "()V", false);
-
-                // Log completion
-                mv.visitFieldInsn(Opcodes.GETSTATIC, "java/lang/System", "out", "Ljava/io/PrintStream;");
-                mv.visitLdcInsn("[DualAuth] F2P token fetch completed during static initialization");
-                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/io/PrintStream", "println", "(Ljava/lang/String;)V",
-                                false);
-
-                mv.visitInsn(Opcodes.RETURN);
-                mv.visitMaxs(1, 0);
-                mv.visitEnd();
+                // [NOTE: Removed the second (duplicate) <clinit> block that was here]
 
                 // public static String generateDynamicIdentityToken(String issuer)
                 // Generate a dynamic identity token signed with the client's embedded JWK
