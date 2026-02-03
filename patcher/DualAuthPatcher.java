@@ -2405,9 +2405,9 @@ public class DualAuthPatcher {
         mv.visitVarInsn(Opcodes.ALOAD, 1);
         mv.visitJumpInsn(Opcodes.IFNULL, finish);
 
-        // Extract content using HELPER class to avoid linkage errors
+        // Extract content - SELF REFERENCE FIX for Linkage Error
         mv.visitVarInsn(Opcodes.ALOAD, 1);
-        mv.visitMethodInsn(Opcodes.INVOKESTATIC, HELPER_CLASS, "extractKeysContent",
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "extractKeysContent",
                         "(Ljava/lang/String;)Ljava/lang/String;", false);
         mv.visitVarInsn(Opcodes.ASTORE, 2);
 
@@ -2552,9 +2552,9 @@ public class DualAuthPatcher {
         mv.visitJumpInsn(Opcodes.IFNULL, offNull);
         mv.visitVarInsn(Opcodes.ALOAD, 3);
         mv.visitVarInsn(Opcodes.ALOAD, 1);
-        
-        // Use HELPER class
-        mv.visitMethodInsn(Opcodes.INVOKESTATIC, HELPER_CLASS, "extractKeysContent",
+
+        // Use SELF method
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "extractKeysContent",
                         "(Ljava/lang/String;)Ljava/lang/String;", false);
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append",
                         "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false);
@@ -2578,8 +2578,9 @@ public class DualAuthPatcher {
         mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
         mv.visitVarInsn(Opcodes.ALOAD, 3);
         mv.visitVarInsn(Opcodes.ALOAD, 2);
-        // Use HELPER class
-        mv.visitMethodInsn(Opcodes.INVOKESTATIC, HELPER_CLASS, "extractKeysContent",
+        
+        // Use SELF method
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, JWKS_FETCHER_CLASS, "extractKeysContent",
                         "(Ljava/lang/String;)Ljava/lang/String;", false);
         mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append",
                         "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false);
@@ -2667,6 +2668,72 @@ public class DualAuthPatcher {
         mv.visitFieldInsn(Opcodes.PUTSTATIC, JWKS_FETCHER_CLASS, "finalAggregatedJson", "Ljava/lang/String;");
         mv.visitInsn(Opcodes.ARETURN);
         mv.visitMaxs(3, 4);
+        mv.visitEnd();
+
+        // --- RESTORED METHOD DEFINITION IN THIS CLASS ---
+        // public static String extractKeysContent(String json)
+        mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                        "extractKeysContent", "(Ljava/lang/String;)Ljava/lang/String;", null, null);
+        mv.visitCode();
+        Label errLabel = new Label();
+
+        // if (json == null) return "";
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        Label nullCheck = new Label();
+        mv.visitJumpInsn(Opcodes.IFNONNULL, nullCheck);
+        mv.visitLdcInsn("");
+        mv.visitInsn(Opcodes.ARETURN);
+        mv.visitLabel(nullCheck);
+        mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+
+        // int idx = json.indexOf("\"keys\":");
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitLdcInsn("\"keys\":");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "indexOf",
+                        "(Ljava/lang/String;)I", false);
+        mv.visitVarInsn(Opcodes.ISTORE, 1);
+
+        // int start = json.indexOf('[', idx);
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitIntInsn(Opcodes.BIPUSH, '[');
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "indexOf", "(II)I", false);
+        mv.visitVarInsn(Opcodes.ISTORE, 2);
+
+        // int end = json.lastIndexOf(']');
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitIntInsn(Opcodes.BIPUSH, ']');
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "lastIndexOf", "(I)I", false);
+        mv.visitVarInsn(Opcodes.ISTORE, 3);
+
+        // Check if found and valid
+        mv.visitVarInsn(Opcodes.ILOAD, 1);
+        mv.visitInsn(Opcodes.ICONST_M1);
+        mv.visitJumpInsn(Opcodes.IF_ICMPEQ, errLabel);
+        mv.visitVarInsn(Opcodes.ILOAD, 2);
+        mv.visitInsn(Opcodes.ICONST_M1);
+        mv.visitJumpInsn(Opcodes.IF_ICMPEQ, errLabel);
+        mv.visitVarInsn(Opcodes.ILOAD, 3);
+        mv.visitVarInsn(Opcodes.ILOAD, 2);
+        mv.visitJumpInsn(Opcodes.IF_ICMPLE, errLabel);
+
+        // String keysContent = json.substring(start + 1, end).trim();
+        mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitVarInsn(Opcodes.ILOAD, 2);
+        mv.visitInsn(Opcodes.ICONST_1);
+        mv.visitInsn(Opcodes.IADD);
+        mv.visitVarInsn(Opcodes.ILOAD, 3);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "substring",
+                        "(II)Ljava/lang/String;", false);
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/String", "trim", "()Ljava/lang/String;",
+                        false);
+        mv.visitInsn(Opcodes.ARETURN);
+
+        mv.visitLabel(errLabel);
+        mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
+        mv.visitLdcInsn("");
+        mv.visitInsn(Opcodes.ARETURN);
+        mv.visitMaxs(4, 4);
         mv.visitEnd();
 
         cw.visitEnd();
