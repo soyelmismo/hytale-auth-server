@@ -5254,7 +5254,7 @@ public class DualAuthPatcher {
         private static byte[] patchJWTValidator(byte[] classBytes) {
                 ClassReader cr = new ClassReader(classBytes);
                 ClassNode cn = new ClassNode();
-                cr.accept(cn, ClassReader.EXPAND_FRAMES);
+                cr.accept(cn, ClassReader.SKIP_FRAMES);
                 boolean modified = false;
 
                 // --- DYNAMIC FIELD DETECTION ---
@@ -6212,7 +6212,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
 
@@ -6531,7 +6531,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
 
@@ -6709,7 +6709,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
 
@@ -6793,7 +6793,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
 
@@ -7452,7 +7452,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
                         String shortName = name.substring(name.lastIndexOf('/') + 1).replace(".class", "");
