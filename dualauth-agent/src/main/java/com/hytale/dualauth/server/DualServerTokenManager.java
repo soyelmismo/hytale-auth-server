@@ -189,25 +189,30 @@ public class DualServerTokenManager {
             return officialIdentityToken;
         }
 
-        // 2. F2P / Sanasol Preference (CRITICAL for trust)
-        // If the player uses our configured F2P issuer, use the EXACT token from the issuer backend.
-        if (f2pIdentityToken != null && (issuer.contains(DualAuthConfig.F2P_DOMAIN) || DualAuthConfig.F2P_DOMAIN.contains(issuer))) {
+        // 2. CRITICAL: For non-official issuers, we MUST generate a dynamic token
+        // The token from /server/auto-auth is for SERVER authentication with the backend,
+        // NOT for CLIENT validation. The client needs a token where:
+        //   - sub = server UUID (from Sanasol)
+        //   - aud = player UUID (the connecting client)
+        //   - iss = the player's issuer
+        // This is ALWAYS required for Hytale's mTLS handshake.
+        
+        String dynamicToken = DualServerIdentity.createDynamicIdentityToken(issuer, playerUuid);
+        if (dynamicToken != null) {
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Generated dynamic server identity for player " + playerUuid + " from issuer " + issuer);
+            }
+            return dynamicToken;
+        }
+
+        // 3. Fallback to cached F2P token (will likely fail client validation)
+        if (f2pIdentityToken != null) {
+            LOGGER.warning("[DualAuth] Using F2P fallback token - may cause 'invalid payload' on client");
             return f2pIdentityToken;
         }
 
-        // 3. Omni-Auth Dynamic Power (For other trusted issuers with captured client keys)
-        if (DualAuthContext.isOmni()) {
-            String dynamicToken = DualServerIdentity.createDynamicIdentityToken(issuer, playerUuid);
-            if (dynamicToken != null) {
-                return dynamicToken;
-            }
-        }
-
-        // 4. Federated Dynamic Cache / Fallback
-        String cached = issuerIdentityCache.get(issuer);
-        if (cached != null) return cached;
-
-        return DualServerIdentity.createDynamicIdentityToken(issuer, playerUuid);
+        // 4. Last resort: cached federated token
+        return issuerIdentityCache.get(issuer);
     }
 
     /**
