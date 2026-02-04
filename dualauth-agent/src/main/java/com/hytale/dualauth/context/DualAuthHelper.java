@@ -59,6 +59,142 @@ public class DualAuthHelper {
         return false;
     }
 
+    public static boolean isPublicIssuer(String issuer) {
+        if (issuer == null) return false;
+        
+        // 1. Check Blacklist
+        if (DualAuthConfig.ISSUER_BLACKLIST.contains(issuer)) {
+             if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Issuer is blacklisted: " + issuer);
+            }
+            return false;
+        }
+
+        // 2. Check Whitelist
+        if (DualAuthConfig.ISSUER_WHITELIST.contains(issuer)) {
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Issuer is whitelisted: " + issuer);
+            }
+            return true;
+        }
+        
+        // 3. Official issuers: detection only if forced
+        if (isOfficialIssuer(issuer) && !DualAuthConfig.FORCE_DETECTION_FOR_ALL) {
+            return false;
+        }
+
+        // 4. Check Cache
+        DualServerTokenManager.IssuerDetectionResult cached = DualServerTokenManager.getIssuerDetectionCache().get(issuer);
+        if (cached != null && !cached.isExpired()) {
+             if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Using cached detection for issuer: " + issuer + " -> public: " + cached.isPublic());
+            }
+            return cached.isPublic();
+        }
+
+        // 5. Async Detection (Blocking with timeout since we need result now)
+        return detectIssuerPublicAsync(issuer);
+    }
+
+    private static boolean detectIssuerPublicAsync(String issuer) {
+        java.util.concurrent.CompletableFuture<Boolean> detectionFuture = java.util.concurrent.CompletableFuture.supplyAsync(() -> performJwksDetection(issuer));
+        
+        try {
+            boolean isPublic = detectionFuture.get(DualAuthConfig.JWKS_DETECTION_TIMEOUT, java.util.concurrent.TimeUnit.MILLISECONDS);
+            
+            // Cache result from future
+            cacheDetectionResult(issuer, isPublic, null);
+            
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Detected issuer: " + issuer + " -> public: " + isPublic);
+            }
+            return isPublic;
+        } catch (java.util.concurrent.TimeoutException e) {
+            cacheDetectionResult(issuer, false, e);
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Detection timeout for issuer: " + issuer + " -> assuming not public");
+            }
+            return false;
+        } catch (Exception e) {
+            cacheDetectionResult(issuer, false, e);
+             if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Detection error for issuer: " + issuer + " -> " + e.getMessage());
+            }
+            return false;
+        }
+    }
+
+    private static void cacheDetectionResult(String issuer, boolean isPublic, Exception error) {
+        String jwksUrl = isPublic ? buildJwksUrl(issuer) : null;
+        DualServerTokenManager.IssuerDetectionResult result = error != null ? 
+            new DualServerTokenManager.IssuerDetectionResult(error, DualAuthConfig.ISSUER_DETECTION_CACHE_TTL) :
+            new DualServerTokenManager.IssuerDetectionResult(isPublic, jwksUrl, DualAuthConfig.ISSUER_DETECTION_CACHE_TTL);
+        
+        DualServerTokenManager.getIssuerDetectionCache().put(issuer, result);
+    }
+
+    private static String buildJwksUrl(String issuer) {
+        String baseUrl = issuer;
+        if (baseUrl.endsWith("/")) {
+            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+        }
+        // Standard path
+        return baseUrl + "/.well-known/jwks.json"; 
+    }
+
+    private static boolean performJwksDetection(String issuer) {
+        try {
+            String jwksUrl = buildJwksUrl(issuer);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(jwksUrl).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", "Hytale-Server/1.0");
+            conn.setConnectTimeout(DualAuthConfig.JWKS_DETECTION_TIMEOUT);
+            conn.setReadTimeout(DualAuthConfig.JWKS_DETECTION_TIMEOUT);
+            conn.setInstanceFollowRedirects(true);
+            
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                 String responseBody = new String(conn.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                 if (isValidJwksResponse(responseBody)) {
+                     if (Boolean.getBoolean("dualauth.debug")) {
+                         System.out.println("[DualAuth] Valid JWKS found at: " + jwksUrl);
+                     }
+                     return true;
+                 } else {
+                     if (Boolean.getBoolean("dualauth.debug")) {
+                         System.out.println("[DualAuth] Invalid JWKS format at: " + jwksUrl);
+                     }
+                 }
+            } else {
+                 if (Boolean.getBoolean("dualauth.debug")) {
+                    System.out.println("[DualAuth] JWKS endpoint returned: " + responseCode + " for: " + jwksUrl);
+                }
+            }
+        } catch (Exception e) {
+             if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] JWKS detection failed for " + issuer + ": " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    private static boolean isValidJwksResponse(String responseBody) {
+        try {
+            if (responseBody == null || responseBody.trim().isEmpty()) return false;
+            if (!responseBody.contains("\"keys\"")) return false;
+            
+            int keysIndex = responseBody.indexOf("\"keys\"");
+            if (keysIndex == -1) return false;
+            
+            int arrayStart = responseBody.indexOf("[", keysIndex);
+            int arrayEnd = responseBody.indexOf("]", arrayStart);
+            
+            return arrayStart != -1 && arrayEnd != -1 && arrayEnd > arrayStart + 1;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public static String getSessionUrlForIssuer(String issuer) {
         if (issuer == null || isOfficialIssuer(issuer)) return DualAuthConfig.OFFICIAL_SESSION_URL;
         return issuer; 

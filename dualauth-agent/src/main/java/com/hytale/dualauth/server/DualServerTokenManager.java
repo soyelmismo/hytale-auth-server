@@ -36,6 +36,69 @@ public class DualServerTokenManager {
     // Dynamic caches for federated issuers
     private static final ConcurrentHashMap<String, String> issuerSessionCache = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, String> issuerIdentityCache = new ConcurrentHashMap<>();
+    
+    // New federated cache for public issuers (by issuer)
+    private static final ConcurrentHashMap<String, FederatedIssuerTokens> federatedIssuerCache = new ConcurrentHashMap<>();
+
+    public static class FederatedIssuerTokens {
+        private final String identityToken;
+        private final String sessionToken;
+        private final long timestamp;
+        private final long ttl;
+        
+        public FederatedIssuerTokens(String identityToken, String sessionToken, long ttl) {
+            this.identityToken = identityToken;
+            this.sessionToken = sessionToken;
+            this.timestamp = System.currentTimeMillis();
+            this.ttl = ttl;
+        }
+        
+        public boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > ttl;
+        }
+        
+        public String getIdentityToken() { return identityToken; }
+        public String getSessionToken() { return sessionToken; }
+    }
+
+    // Cache for issuer detection results
+    public static class IssuerDetectionResult {
+        private final boolean isPublic;
+        private final String jwksUrl;
+        private final long timestamp;
+        private final long ttl;
+        private final Exception lastError;
+
+        public IssuerDetectionResult(boolean isPublic, String jwksUrl, long ttl) {
+            this.isPublic = isPublic;
+            this.jwksUrl = jwksUrl;
+            this.timestamp = System.currentTimeMillis();
+            this.ttl = ttl;
+            this.lastError = null;
+        }
+
+        public IssuerDetectionResult(Exception error, long ttl) {
+            this.isPublic = false;
+            this.jwksUrl = null;
+            this.timestamp = System.currentTimeMillis();
+            this.ttl = ttl;
+            this.lastError = error;
+        }
+
+        public boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > ttl;
+        }
+
+        public boolean isPublic() { return isPublic; }
+        public String getJwksUrl() { return jwksUrl; }
+        public Exception getLastError() { return lastError; }
+    }
+
+    private static final ConcurrentHashMap<String, IssuerDetectionResult> issuerDetectionCache = new ConcurrentHashMap<>();
+
+    public static ConcurrentHashMap<String, IssuerDetectionResult> getIssuerDetectionCache() {
+        return issuerDetectionCache;
+    }
 
     public static synchronized void setOfficialTokens(String sessionToken, String identityToken) {
         officialSessionToken = sessionToken;
@@ -171,9 +234,104 @@ public class DualServerTokenManager {
         return issuerSessionCache.get(issuer);
     }
 
+    public static String getOrFetchFederatedServerIdentity(String issuer) {
+        if (issuer == null) return null;
+        
+        // 1. Check existing cache
+        FederatedIssuerTokens cached = federatedIssuerCache.get(issuer);
+        if (cached != null && !cached.isExpired()) {
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Using cached federated tokens for issuer: " + issuer);
+            }
+            return cached.getIdentityToken();
+        }
+        
+        // 2. If missing or expired, fetch from issuer
+        if (Boolean.getBoolean("dualauth.debug")) {
+            System.out.println("[DualAuth] Fetching federated tokens from issuer: " + issuer);
+        }
+        
+        // Avoid blocking critical threads blindly, though this is likely called from serialize() which is sync.
+        // In refined future versions, this should be pre-fetched or async.
+        FederatedIssuerTokens freshTokens = DualServerIdentity.fetchFederatedTokensFromIssuer(issuer);
+        if (freshTokens != null) {
+            // 3. Cache it
+            federatedIssuerCache.put(issuer, freshTokens);
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Cached federated tokens for issuer: " + issuer);
+            }
+            return freshTokens.getIdentityToken();
+        }
+        
+        // 4. Fail
+        if (Boolean.getBoolean("dualauth.debug")) {
+            System.out.println("[DualAuth] Failed to fetch federated tokens for issuer: " + issuer);
+        }
+        return null;
+    }
+
+    public static void cleanupExpiredFederatedCache() {
+        java.util.Iterator<java.util.Map.Entry<String, FederatedIssuerTokens>> iterator = federatedIssuerCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            java.util.Map.Entry<String, FederatedIssuerTokens> entry = iterator.next();
+            if (entry.getValue().isExpired()) {
+                iterator.remove();
+                if (Boolean.getBoolean("dualauth.debug")) {
+                    System.out.println("[DualAuth] Cleaned up expired cache for issuer: " + entry.getKey());
+                }
+            }
+        }
+    }
+
+    public static void cleanupExpiredDetectionCache() {
+        java.util.Iterator<java.util.Map.Entry<String, IssuerDetectionResult>> iterator = 
+            issuerDetectionCache.entrySet().iterator();
+        
+        int cleaned = 0;
+        while (iterator.hasNext()) {
+            java.util.Map.Entry<String, IssuerDetectionResult> entry = iterator.next();
+            if (entry.getValue().isExpired()) {
+                iterator.remove();
+                cleaned++;
+            }
+        }
+        
+        if (Boolean.getBoolean("dualauth.debug") && cleaned > 0) {
+            System.out.println("[DualAuth] Cleaned up " + cleaned + " expired issuer detection entries");
+        }
+    }
+
+    public static void logDetectionStats() {
+        int total = issuerDetectionCache.size();
+        int publicCount = 0;
+        int errorCount = 0;
+        
+        for (IssuerDetectionResult result : issuerDetectionCache.values()) {
+            if (result.isPublic()) publicCount++;
+            if (result.getLastError() != null) errorCount++;
+        }
+        
+        System.out.println("[DualAuth] Issuer Detection Stats:");
+        System.out.println("  Total cached: " + total);
+        System.out.println("  Public issuers: " + publicCount);
+        System.out.println("  Error entries: " + errorCount);
+    }
+
+    private static final java.util.concurrent.ScheduledExecutorService cacheCleanupExecutor = 
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+
+    static {
+        // Clean cache every 30 minutes
+        cacheCleanupExecutor.scheduleAtFixedRate(() -> {
+            cleanupExpiredFederatedCache();
+            cleanupExpiredDetectionCache();
+            if (Boolean.getBoolean("dualauth.debug")) logDetectionStats();
+        }, 30, 30, java.util.concurrent.TimeUnit.MINUTES);
+    }
+    
     /**
      * Gets the identity token for the given issuer.
-     * Prioritizes: Official → Omni-Auth Dynamic → F2P → Federated Cache
+     * Prioritizes: Official → Omni-Auth Dynamic → Federated Cache → F2P Fallback
      */
     public static String getIdentityTokenForIssuer(String issuer, String playerUuid) {
         if (issuer == null) issuer = DualAuthContext.getIssuer();
@@ -184,11 +342,23 @@ public class DualServerTokenManager {
             return f2pIdentityToken != null ? f2pIdentityToken : officialIdentityToken;
         }
 
-        // PATCHER STRATEGY: Only hytale.com issuers provide identity tokens
+        // 1. Official issuers use official tokens
         if (DualAuthHelper.isOfficialIssuerStrict(issuer)) {
             return officialIdentityToken;
         }
 
+        // 2. Omni-Auth uses per-player cache (or dynamic generation)
+        if (DualAuthContext.isOmni()) {
+            return DualServerIdentity.createDynamicIdentityToken(issuer, playerUuid); 
+        }
+
+        // 3. Public issuers use federated cache
+        if (DualAuthHelper.isPublicIssuer(issuer)) {
+             String fedToken = getOrFetchFederatedServerIdentity(issuer);
+             if (fedToken != null) return fedToken;
+        }
+
+        // 4. Fallback (F2P promiscuous)
         // PATCHER STRATEGY: For non-official issuers, we use the F2P identity token.
         // This token is signed by the backend and validatable by the F2P client.
         if (f2pIdentityToken != null) {
@@ -222,8 +392,12 @@ public class DualServerTokenManager {
             return officialIdentityToken != null;
         }
         
-        if (DualAuthContext.isOmni() && DualAuthContext.getJwk() != null) {
-            return true; // Can generate dynamically
+        if (DualAuthContext.isOmni()) {
+            return true; 
+        }
+
+        if (federatedIssuerCache.containsKey(issuer)) {
+            return true;
         }
         
         if (f2pIdentityToken != null) {

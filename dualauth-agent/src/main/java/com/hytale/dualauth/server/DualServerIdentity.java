@@ -115,6 +115,69 @@ public class DualServerIdentity {
         return null; // Original patcher flow doesn't generate them dynamically for official either
     }
 
+    public static DualServerTokenManager.FederatedIssuerTokens fetchFederatedTokensFromIssuer(String issuer) {
+        try {
+            // 1. Build issuer endpoint
+            String baseUrl = issuer.endsWith("/") ? issuer.substring(0, issuer.length() - 1) : issuer;
+            String autoAuthEndpoint = baseUrl + "/server/auto-auth";
+            
+            // 2. Prepare request with server data
+            String serverUuid = DualAuthHelper.getServerUuid();
+            String serverName = DualAuthHelper.getServerName();
+            
+            String jsonBody = String.format(
+                "{\"uuid\":\"%s\",\"name\":\"%s\"}", 
+                serverUuid, serverName
+            );
+            
+            // 3. Execute HTTP request
+            URL url = new URL(autoAuthEndpoint);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("User-Agent", "Hytale-Server/1.0");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setDoOutput(true);
+            
+            // 4. Send request
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+            }
+            
+            // 5. Process response
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                String responseBody = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                
+                // 6. Extract tokens
+                String identityToken = extractJsonField(responseBody, "identityToken");
+                String sessionToken = extractJsonField(responseBody, "sessionToken");
+                
+                if (identityToken != null && !identityToken.isEmpty()) {
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] Successfully fetched federated tokens from: " + issuer);
+                    }
+                    
+                    // TTL of 1 hour for federated tokens
+                    long ttl = 3600000L; 
+                    return new DualServerTokenManager.FederatedIssuerTokens(identityToken, sessionToken, ttl);
+                }
+            } else {
+                if (Boolean.getBoolean("dualauth.debug")) {
+                    System.out.println("[DualAuth] HTTP error from issuer: " + issuer + " - Code: " + responseCode);
+                }
+            }
+            
+        } catch (Exception e) {
+            if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] Exception fetching federated tokens: " + e.getMessage());
+            }
+        }
+        
+        return null;
+    }
+
 
     private static String fetchUrl(String urlString) {
         HttpURLConnection conn = null;

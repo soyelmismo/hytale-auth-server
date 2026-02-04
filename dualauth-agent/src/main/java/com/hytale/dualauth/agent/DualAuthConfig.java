@@ -26,6 +26,13 @@ public class DualAuthConfig {
     public static final Set<String> TRUSTED_ISSUERS = parseCsv("HYTALE_TRUSTED_ISSUERS");
     public static final long JWKS_CACHE_TTL_MS = getEnvLongSeconds("HYTALE_JWKS_CACHE_TTL", 3600L) * 1000L;
 
+    // Issuer Detection Configuration (Public Discovery)
+    public static final long ISSUER_DETECTION_CACHE_TTL = getEnvLongSeconds("HYTALE_ISSUER_DETECTION_TTL", 300L) * 1000L; // 5 min default
+    public static final int JWKS_DETECTION_TIMEOUT = (int)getEnvLongSeconds("HYTALE_JWKS_DETECTION_TIMEOUT", 3L) * 1000; // 3 sec default
+    public static final Set<String> ISSUER_WHITELIST = parseCsv("HYTALE_ISSUER_WHITELIST");
+    public static final Set<String> ISSUER_BLACKLIST = parseCsv("HYTALE_ISSUER_BLACKLIST");
+    public static final boolean FORCE_DETECTION_FOR_ALL = getBoolean("HYTALE_FORCE_ISSUER_DETECTION", false);
+
     private static String getEnv(String name, String defaultValue) {
         String value = System.getenv(name);
         return (value != null && !value.isEmpty()) ? value : defaultValue;
