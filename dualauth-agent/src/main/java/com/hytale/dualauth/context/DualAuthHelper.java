@@ -352,13 +352,22 @@ public class DualAuthHelper {
                 issuer = extractIssuerFromToken(currentToken);
             }
 
-            // 3. PATCHER STRATEGY: Only hytale.com sends serverIdentityToken
-            // For non-official issuers (Sanasol, etc.), suppress server identity to bypass client validation
+            // 3. PATCHER STRATEGY: For non-official issuers, we MUST provide the F2P identity token
+            // so the client can validate mutual auth against the F2P JWKS.
+            // Sending null causes "Server did not provide identity token" error on client.
             if (issuer != null && !isOfficialIssuerStrict(issuer)) {
-                // Suppress server identity for non-official issuers
-                idField.set(authGrant, null);
-                if (Boolean.getBoolean("dualauth.debug")) {
-                    System.out.println("[DualAuth] AuthGrant: Suppressed serverIdentityToken for non-official issuer: " + issuer);
+                String rep = DualServerTokenManager.getIdentityTokenForIssuer(issuer, DualAuthContext.getPlayerUuid());
+                if (rep != null) {
+                    idField.set(authGrant, rep);
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] AuthGrant: Replaced serverIdentityToken for non-official issuer: " + issuer + " (len=" + rep.length() + ")");
+                    }
+                } else {
+                    // Only suppress if we truly have no token to give (fallback behavior)
+                    idField.set(authGrant, null);
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] AuthGrant: Suppressed serverIdentityToken (no replacement found) for issuer: " + issuer);
+                    }
                 }
                 return;
             }

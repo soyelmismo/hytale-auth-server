@@ -189,9 +189,15 @@ public class DualServerTokenManager {
             return officialIdentityToken;
         }
 
-        // For non-official issuers, return null to suppress server identity
+        // PATCHER STRATEGY: For non-official issuers, we use the F2P identity token.
+        // This token is signed by the backend and validatable by the F2P client.
+        if (f2pIdentityToken != null) {
+            return f2pIdentityToken;
+        }
+
+        // Only return null if we honestly don't have ANY token to give
         if (Boolean.getBoolean("dualauth.debug")) {
-            System.out.println("[DualAuth] Suppressing server identity token for non-official issuer: " + issuer);
+            System.out.println("[DualAuth] partial failure: requested identity for " + issuer + " but no F2P token available");
         }
         return null;
     }
