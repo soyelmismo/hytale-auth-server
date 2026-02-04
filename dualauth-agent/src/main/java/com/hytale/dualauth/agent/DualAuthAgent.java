@@ -8,6 +8,8 @@ import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.utility.JavaModule;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
+import java.util.Properties;
+import java.io.InputStream;
 
 import static net.bytebuddy.matcher.ElementMatchers.*;
 
@@ -21,13 +23,45 @@ import static net.bytebuddy.matcher.ElementMatchers.*;
  * 4. Token management for F2P/Omni clients
  */
 public class DualAuthAgent {
+    public static final String VERSION = loadVersion();
+
+    private static String loadVersion() {
+        try (InputStream is = DualAuthAgent.class.getResourceAsStream("/version.properties")) {
+            Properties prop = new Properties();
+            if (is != null) {
+                prop.load(is);
+                return prop.getProperty("version", "1.0.0-UNKNOWN");
+            }
+        } catch (Exception e) {
+            // Fallback
+        }
+        return "1.0.0-DEV";
+    }
+
+    public static void main(String[] args) {
+        if (args.length > 0 && (args[0].equals("--version") || args[0].equals("-v"))) {
+            System.out.println("DualAuth Agent version: " + VERSION);
+        } else {
+            System.out.println("DualAuth Agent v" + VERSION);
+            System.out.println("Usage: java -javaagent:dualauth-agent.jar -jar HytaleServer.jar");
+            System.out.println("   or: java -jar dualauth-agent.jar --version");
+        }
+    }
 
     public static void premain(String args, Instrumentation inst) {
+        // Handle --version in agent arguments
+        if (args != null && (args.contains("version") || args.contains("-v"))) {
+            System.out.println("DualAuth Agent version: " + VERSION);
+            if (args.equals("version") || args.equals("--version") || args.equals("-v")) {
+                return; // Exit premain if only version was requested
+            }
+        }
+
         // Enable experimental mode for newer Java versions
         System.setProperty("net.bytebuddy.experimental", "true");
         
         System.out.println("╔══════════════════════════════════════════════════════════════╗");
-        System.out.println("║           DualAuth ByteBuddy Agent v1.0.0                    ║");
+        System.out.println("║           DualAuth ByteBuddy Agent v" + padRight(VERSION, 24) + "║");
         System.out.println("╠══════════════════════════════════════════════════════════════╣");
         System.out.println("║ Configuration:                                               ║");
         System.out.println("║   F2P Domain: " + padRight(DualAuthConfig.F2P_DOMAIN, 47) + "║");

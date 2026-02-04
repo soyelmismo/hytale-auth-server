@@ -36,6 +36,8 @@ jobs:
     name: Build DualAuth Agent & Download Server
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -54,6 +56,14 @@ jobs:
           chmod +x ./gradlew
           ./gradlew clean shadowJar
           ls -la build/libs/*.jar
+
+      - name: Extract version
+        id: get_version
+        working-directory: dualauth-agent
+        run: |
+          VERSION=$(grep "version =" build.gradle | cut -d"'" -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
 
       - name: Download Original Server JAR
         run: |
@@ -1254,3 +1264,63 @@ jobs:
             server/server_trusted.log
             server/server_no_tokens.log
           retention-days: 7
+
+  release:
+    name: Deploy Release
+    needs: [build-agent, test-server-boot, test-mock-client]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Agent Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dualauth-agent
+          path: ./
+          merge-multiple: true
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          # Get commits for dualauth-agent since last tag or all if no tags
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            # No tags found, using all commits for the folder
+            LOG=$(git log --oneline -- dualauth-agent/)
+          else
+            # Get changes since last tag that affected the folder
+            LOG=$(git log ${LAST_TAG}..HEAD --oneline -- dualauth-agent/)
+          fi
+          
+          # Clean up log and escape for GH output
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          if [ -z "$LOG" ]; then
+            echo "No specific changes in dualauth-agent/ since last release." >> $GITHUB_OUTPUT
+          else
+            echo "$LOG" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build-agent.outputs.version }}
+          name: DualAuth Agent v${{ needs.build-agent.outputs.version }}
+          body: |
+            ## DualAuth Agent Release
+            
+            This release contains the latest `dualauth-agent.jar` built automatically by CI.
+            
+            ### Changes in dualauth-agent/:
+            ${{ steps.changelog.outputs.CHANGELOG }}
+          files: dualauth-agent.jar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

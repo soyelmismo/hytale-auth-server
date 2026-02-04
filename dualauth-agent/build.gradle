@@ -4,11 +4,20 @@ plugins {
 }
 
 group = 'com.hytale.dualauth'
+
+// Only change the version here
 version = '1.0.0'
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("version.properties") {
+        expand "version": project.version
     }
 }
 
@@ -29,7 +38,9 @@ shadowJar {
     archiveBaseName.set('dualauth-agent')
     manifest {
         attributes(
+            'Main-Class': 'com.hytale.dualauth.agent.DualAuthAgent',
             'Premain-Class': 'com.hytale.dualauth.agent.DualAuthAgent',
+            'Implementation-Version': project.version,
             'Can-Redefine-Classes': 'true',
             'Can-Retransform-Classes': 'true',
             'Boot-Class-Path': '.' 
