@@ -27,7 +27,6 @@ legacy/
 
 # Patching dependencies
 patcher/lib/
-*.jar
 *.class
 *.txt
 *.diff
