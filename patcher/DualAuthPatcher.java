@@ -6793,7 +6793,7 @@ public class DualAuthPatcher {
                 try {
                         ClassReader reader = new ClassReader(classBytes);
                         ClassNode classNode = new ClassNode();
-                        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+                        reader.accept(classNode, ClassReader.SKIP_FRAMES);
 
                         boolean modified = false;
 
@@ -6841,7 +6841,7 @@ public class DualAuthPatcher {
                         }
 
                         if (modified) {
-                                ClassWriter writer = new SafeClassWriter(ClassWriter.COMPUTE_MAXS);
+                                ClassWriter writer = new SafeClassWriter(ClassWriter.COMPUTE_FRAMES);
                                 classNode.accept(writer);
                                 return writer.toByteArray();
                         }
@@ -6940,22 +6940,7 @@ public class DualAuthPatcher {
                 for (AbstractInsnNode insn : method.instructions.toArray()) {
                         int op = insn.getOpcode();
                         if (op == Opcodes.IRETURN || op == Opcodes.ARETURN || op == Opcodes.RETURN) {
-                                InsnList frameInject = new InsnList();
-                                frameInject.add(injection);
-
-                                // Add appropriate frame for the 'skipStorage' label
-                                if (op == Opcodes.RETURN) {
-                                        // Void return: Stack is empty. F_SAME.
-                                        frameInject.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
-                                } else if (op == Opcodes.ARETURN) {
-                                        // Object return: Stack has 1 Object. F_SAME1.
-                                        frameInject.add(new FrameNode(Opcodes.F_SAME1, 0, null, 1, new Object[] { "java/lang/Object" }));
-                                } else if (op == Opcodes.IRETURN) {
-                                        // Int return: Stack has 1 Integer. F_SAME1.
-                                        frameInject.add(new FrameNode(Opcodes.F_SAME1, 0, null, 1, new Object[] { Opcodes.INTEGER }));
-                                }
-
-                                method.instructions.insertBefore(insn, frameInject);
+                                method.instructions.insertBefore(insn, injection);
                                 patchCount++;
                                 return true;
                         }
@@ -7062,8 +7047,6 @@ public class DualAuthPatcher {
                 }
 
                 inject.add(notNull);
-                // Manual frame for branch target
-                inject.add(new FrameNode(Opcodes.F_SAME1, 0, null, 1, new Object[] { "java/lang/String" }));
 
                 // Find ARETURN
                 AbstractInsnNode target = null;
