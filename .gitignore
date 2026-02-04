@@ -33,3 +33,4 @@ patcher/lib/
 .gradle
 build/
 dualauth-agent/build.ps1
+dualauth-agent/useful-data-structures

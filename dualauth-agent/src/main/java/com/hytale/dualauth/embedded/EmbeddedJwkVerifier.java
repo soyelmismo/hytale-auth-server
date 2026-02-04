@@ -106,15 +106,24 @@ public class EmbeddedJwkVerifier {
                 return null;
             }
 
-            // Build Claims (Matches OriginalDualAuthPatcher.java precisely)
+            // Build Claims - CRITICAL FIX:
+            // For server identity tokens sent TO clients:
+            //   sub = SERVER UUID (who is signing/sending)
+            //   aud = PLAYER UUID (who is receiving)
             JWTClaimsSet.Builder builder = new JWTClaimsSet.Builder()
                     .issuer(issuer)
                     .issueTime(new Date())
                     .expirationTime(new Date(System.currentTimeMillis() + 3600_000L));
 
-            String subject = DualAuthContext.getPlayerUuid();
-            if (subject == null) subject = "00000000-0000-0000-0000-000000000000";
-            builder.subject(subject);
+            // Subject = Server UUID
+            String serverUuid = DualAuthHelper.getServerUuid();
+            builder.subject(serverUuid);
+            
+            // Audience = Player UUID (who receives this token)
+            String playerUuid = DualAuthContext.getPlayerUuid();
+            if (playerUuid != null && !playerUuid.isEmpty()) {
+                builder.audience(playerUuid);
+            }
 
             builder.claim("scope", "hytale:server hytale:client");
 
@@ -124,6 +133,7 @@ public class EmbeddedJwkVerifier {
                     builder.claim("username", username);
                 }
             }
+
 
             // Build Header (Matches OriginalDualAuthPatcher.java: includes public JWK)
             // Note: We use toPublicJWK() here to ensure we don't send our 'd' back to the client!

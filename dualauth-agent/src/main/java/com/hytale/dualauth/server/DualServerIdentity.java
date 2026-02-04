@@ -111,10 +111,19 @@ public class DualServerIdentity {
             String aud = playerUuid;
             if (aud == null) aud = DualAuthContext.getPlayerUuid();
             if (aud == null || aud.isEmpty()) aud = UUID.randomUUID().toString();
+            
+            String sub = DualAuthHelper.getServerUuid();
+
+            // DEBUG: Log all claims for troubleshooting
+            System.out.println("[DualAuth] Creating dynamic server identity token:");
+            System.out.println("[DualAuth]   iss (issuer): " + issuer);
+            System.out.println("[DualAuth]   sub (server UUID): " + sub);
+            System.out.println("[DualAuth]   aud (player UUID): " + aud);
+            System.out.println("[DualAuth]   kid (key ID): " + kp.getKeyID());
 
             JWTClaimsSet claims = new JWTClaimsSet.Builder()
                 .issuer(issuer)
-                .subject(DualAuthHelper.getServerUuid())
+                .subject(sub)
                 .audience(aud) // CRITICAL: Audience must be the Player's UUID
                 .issueTime(new Date())
                 .expirationTime(new Date(System.currentTimeMillis() + 3600000L))
@@ -126,8 +135,10 @@ public class DualServerIdentity {
             
             return signNative(header + "." + payload, kp);
         } catch (Exception e) { 
+            LOGGER.log(Level.WARNING, "[DualAuth] Failed to create dynamic identity token: " + e.getMessage());
             return null; 
         }
+
     }
 
     private static String fetchUrl(String urlString) {
