@@ -335,11 +335,21 @@ public class DualAuthHelper {
 
     public static void maybeReplaceServerIdentity(Object authGrant) {
         try {
+            // 1. Get the current token first
+            Field idField = authGrant.getClass().getDeclaredField("serverIdentityToken");
+            idField.setAccessible(true);
+            String currentToken = (String) idField.get(authGrant);
+            
+            // 2. Determine Issuer (Context > Token)
             String issuer = DualAuthContext.getIssuer();
+            if (issuer == null && currentToken != null) {
+                issuer = extractIssuerFromToken(currentToken);
+                if (Boolean.getBoolean("dualauth.debug")) {
+                    System.out.println("[DualAuth] AuthGrant: Recovered issuer from token: " + issuer);
+                }
+            }
+
             if (issuer != null && !isOfficialIssuer(issuer)) {
-                Field idField = authGrant.getClass().getDeclaredField("serverIdentityToken");
-                idField.setAccessible(true);
-                
                 // Try to get player UUID from context
                 String playerUuid = DualAuthContext.getPlayerUuid();
                 
@@ -349,10 +359,26 @@ public class DualAuthHelper {
                     if (Boolean.getBoolean("dualauth.debug")) {
                         System.out.println("[DualAuth] AuthGrant: Replaced server identity token for " + issuer + (playerUuid != null ? " (Player: " + playerUuid + ")" : ""));
                     }
+                } else {
+                     if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] AuthGrant: No replacement token found for issuer: " + issuer);
+                    }
+                }
+            } else {
+                 if (Boolean.getBoolean("dualauth.debug")) {
+                     // Only log if we have a token but decided not to replace (official or unknown)
+                     if (currentToken != null) {
+                        System.out.println("[DualAuth] AuthGrant: Skipping replacement. Issuer: " + issuer + ", IsOfficial: " + isOfficialIssuer(issuer));
+                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+             if (Boolean.getBoolean("dualauth.debug")) {
+                System.out.println("[DualAuth] AuthGrant: Error in maybeReplaceServerIdentity: " + e.getMessage());
+            }
+        }
     }
+
 
     private static String cachedServerUuid = null;
     public static String getServerUuid() {
