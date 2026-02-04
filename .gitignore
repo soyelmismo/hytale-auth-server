@@ -27,7 +27,10 @@ legacy/
 
 # Patching dependencies
 patcher/lib/
-patcher/*.jar
-patcher/*.class
+*.jar
+*.class
 *.txt
 *.diff
+.gradle
+build/
+dualauth-agent/build.ps1
