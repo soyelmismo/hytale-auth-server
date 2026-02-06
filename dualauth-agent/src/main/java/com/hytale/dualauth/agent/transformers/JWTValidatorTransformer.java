@@ -54,14 +54,30 @@ public class JWTValidatorTransformer implements net.bytebuddy.agent.builder.Agen
         public static Object enter(@Advice.This Object thiz, @Advice.Argument(0) String token, @Advice.Origin("#m") String methodName, @Advice.Origin("#d") String methodDescriptor) {
             try {
 
-                // 1. Omni-Auth Check
+                // Extract issuer first to determine processing path
+                String issuer = DualAuthHelper.extractIssuerFromToken(token);
+                
+                // CRITICAL FIX: For official issuers, ensure clean context processing
+                if (issuer != null && DualAuthHelper.isOfficialIssuer(issuer)) {
+                    // Clear any residual DualAuth context that might interfere
+                    DualAuthContext.softClear();
+                    
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] ValidateAdvice: Processing official issuer with clean context: " + issuer);
+                    }
+                    
+                    // Continue to original validation for official issuers
+                    // This ensures official tokens are validated by the original system
+                    return null;
+                }
+
+                // 1. Omni-Auth Check (only for non-official issuers)
                 com.nimbusds.jwt.JWTClaimsSet claims = EmbeddedJwkVerifier.verifyAndGetClaims(token);
                 if (claims != null) {
                     return DualAuthHelper.createJWTClaimsWrapper(thiz.getClass().getClassLoader(), claims, methodName, methodDescriptor);
                 }
 
                 // 2. F2P / Trusted Check
-                String issuer = DualAuthHelper.extractIssuerFromToken(token);
                 if (issuer != null) {
                     DualAuthContext.setIssuer(issuer);
                     DualJwksFetcher.registerIssuer(issuer);
@@ -178,19 +194,36 @@ public class JWTValidatorTransformer implements net.bytebuddy.agent.builder.Agen
     }
 
     /**
-     * Cache Protection Advice - Prevents cache invalidation for official issuers
-     * Ensures official JWKS cache remains intact and functional
+     * Cache Protection Advice - Selective cache invalidation for official issuers
+     * Only blocks cache invalidation for official issuers if it's a background refresh
+     * Allows manual/forced invalidation to prevent stale cache issues
      */
     public static class CacheProtectionAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
-        public static boolean enter(@Advice.This Object thiz) {
+        public static boolean enter(@Advice.This Object thiz, @Advice.Origin("#m") String methodName) {
             try {
                 String currentIssuer = DualAuthContext.getIssuer();
                 if (currentIssuer != null && DualAuthHelper.isOfficialIssuer(currentIssuer)) {
-                    if (Boolean.getBoolean("dualauth.debug")) {
-                        System.out.println("[DualAuth] CacheProtection: Blocking cache invalidation for official issuer: " + currentIssuer);
+                    // Allow cache invalidation for official issuers in these cases:
+                    // 1. Manual invalidation methods (contains "invalidate", "clear")
+                    // 2. Forced refresh (contains "refresh")
+                    // 3. Background methods that might indicate stale cache
+                    boolean isManualInvalidation = methodName.toLowerCase().contains("invalidate") || 
+                                               methodName.toLowerCase().contains("clear");
+                    boolean isForcedRefresh = methodName.toLowerCase().contains("refresh");
+                    
+                    if (isManualInvalidation || isForcedRefresh) {
+                        if (Boolean.getBoolean("dualauth.debug")) {
+                            System.out.println("[DualAuth] CacheProtection: Allowing " + methodName + " for official issuer: " + currentIssuer);
+                        }
+                        return false; // Allow manual/forced invalidation
                     }
-                    return true; // Skip cache invalidation for officials
+                    
+                    // Only block automatic background refreshes for official issuers
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuth] CacheProtection: Blocking automatic cache invalidation for official issuer: " + currentIssuer + " (method: " + methodName + ")");
+                    }
+                    return true; // Skip automatic cache invalidation for officials
                 }
             } catch (Exception ignored) {}
             return false; // Allow normal cache invalidation for non-officials
