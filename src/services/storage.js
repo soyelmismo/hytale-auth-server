@@ -720,6 +720,301 @@ async function saveUserData(uuid, data) {
   }
 }
 
+// ============================================================================
+// ATOMIC PLAYER SKINS OPERATIONS (Multi-worker safe)
+// ============================================================================
+
+/**
+ * Atomically add a new player skin to the playerSkins array
+ * Also sets the new skin as active
+ */
+async function atomicAddPlayerSkin(uuid, newSkin) {
+  if (!isConnected()) {
+    console.error('atomicAddPlayerSkin: Redis not connected');
+    return null;
+  }
+
+  const key = `${KEYS.USER}${uuid}`;
+
+  const luaScript = `
+    local currentData = redis.call('GET', KEYS[1])
+    local userData = {}
+
+    if currentData then
+      userData = cjson.decode(currentData)
+    end
+
+    if not userData.playerSkins then
+      userData.playerSkins = {}
+    end
+
+    -- Add new skin to array
+    local newSkin = cjson.decode(ARGV[1])
+    table.insert(userData.playerSkins, newSkin)
+
+    -- Set new skin as active
+    userData.activeSkin = newSkin.id
+
+    -- Also update legacy skin field
+    if newSkin.skinData then
+      local ok, parsedSkin = pcall(cjson.decode, newSkin.skinData)
+      if ok then
+        userData.skin = parsedSkin
+      end
+    end
+
+    -- Save back
+    local result = cjson.encode(userData)
+    redis.call('SET', KEYS[1], result)
+
+    return cjson.encode({playerSkins = userData.playerSkins, activeSkin = userData.activeSkin})
+  `;
+
+  try {
+    const result = await redis.eval(luaScript, 1, key, JSON.stringify(newSkin));
+    const parsed = JSON.parse(result);
+    console.log('atomicAddPlayerSkin: added skin', newSkin.id, 'for', uuid, 'total skins:', parsed.playerSkins?.length, 'now active');
+    return parsed;
+  } catch (e) {
+    console.error('atomicAddPlayerSkin failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Atomically update an existing player skin
+ * Also sets the updated skin as active
+ */
+async function atomicUpdatePlayerSkin(uuid, skinId, updates) {
+  if (!isConnected()) {
+    console.error('atomicUpdatePlayerSkin: Redis not connected');
+    return null;
+  }
+
+  const key = `${KEYS.USER}${uuid}`;
+  const now = new Date().toISOString();
+
+  const luaScript = `
+    local currentData = redis.call('GET', KEYS[1])
+    local userData = {}
+
+    if currentData then
+      userData = cjson.decode(currentData)
+    end
+
+    if not userData.playerSkins then
+      userData.playerSkins = {}
+    end
+
+    local skinId = ARGV[1]
+    local updates = cjson.decode(ARGV[2])
+    local now = ARGV[3]
+    local found = false
+    local skinDataStr = nil
+
+    -- Find and update the skin
+    for i, skin in ipairs(userData.playerSkins) do
+      if skin.id == skinId then
+        if updates.name ~= nil then
+          skin.name = updates.name
+        end
+        if updates.skinData ~= nil then
+          skin.skinData = updates.skinData
+          skinDataStr = updates.skinData
+        else
+          skinDataStr = skin.skinData
+        end
+        skin.updatedAt = now
+        found = true
+        break
+      end
+    end
+
+    -- If not found, create it
+    if not found then
+      local newSkin = {
+        id = skinId,
+        name = updates.name or 'Avatar',
+        skinData = updates.skinData or '',
+        createdAt = now
+      }
+      table.insert(userData.playerSkins, newSkin)
+      skinDataStr = updates.skinData
+    end
+
+    -- Set updated/created skin as active
+    userData.activeSkin = skinId
+
+    -- Also update legacy skin field
+    if skinDataStr then
+      local ok, parsedSkin = pcall(cjson.decode, skinDataStr)
+      if ok then
+        userData.skin = parsedSkin
+      end
+    end
+
+    -- Save back
+    local result = cjson.encode(userData)
+    redis.call('SET', KEYS[1], result)
+
+    return cjson.encode({playerSkins = userData.playerSkins, activeSkin = userData.activeSkin, found = found})
+  `;
+
+  try {
+    const result = await redis.eval(luaScript, 1, key, skinId, JSON.stringify(updates), now);
+    const parsed = JSON.parse(result);
+    console.log('atomicUpdatePlayerSkin: updated skin', skinId, 'for', uuid, 'found:', parsed.found, 'now active');
+    return parsed;
+  } catch (e) {
+    console.error('atomicUpdatePlayerSkin failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Atomically set the active skin
+ */
+async function atomicSetActiveSkin(uuid, skinId) {
+  if (!isConnected()) {
+    console.error('atomicSetActiveSkin: Redis not connected');
+    return null;
+  }
+
+  const key = `${KEYS.USER}${uuid}`;
+
+  const luaScript = `
+    local currentData = redis.call('GET', KEYS[1])
+    local userData = {}
+
+    if currentData then
+      userData = cjson.decode(currentData)
+    end
+
+    local skinId = ARGV[1]
+    userData.activeSkin = skinId
+
+    -- Also update legacy skin field if we have this skin
+    if userData.playerSkins then
+      for i, skin in ipairs(userData.playerSkins) do
+        if skin.id == skinId and skin.skinData then
+          local ok, parsedSkin = pcall(cjson.decode, skin.skinData)
+          if ok then
+            userData.skin = parsedSkin
+          end
+          break
+        end
+      end
+    end
+
+    -- Save back
+    local result = cjson.encode(userData)
+    redis.call('SET', KEYS[1], result)
+
+    return cjson.encode({activeSkin = userData.activeSkin})
+  `;
+
+  try {
+    const result = await redis.eval(luaScript, 1, key, skinId);
+    const parsed = JSON.parse(result);
+    console.log('atomicSetActiveSkin: set active skin', skinId, 'for', uuid);
+    return parsed;
+  } catch (e) {
+    console.error('atomicSetActiveSkin failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Atomically delete a player skin
+ */
+async function atomicDeletePlayerSkin(uuid, skinId) {
+  if (!isConnected()) {
+    console.error('atomicDeletePlayerSkin: Redis not connected');
+    return null;
+  }
+
+  const key = `${KEYS.USER}${uuid}`;
+
+  const luaScript = `
+    local currentData = redis.call('GET', KEYS[1])
+    local userData = {}
+
+    if currentData then
+      userData = cjson.decode(currentData)
+    end
+
+    if not userData.playerSkins then
+      return cjson.encode({deleted = false, playerSkins = {}, activeSkin = userData.activeSkin})
+    end
+
+    local skinId = ARGV[1]
+    local deleted = false
+    local newSkins = {}
+
+    for i, skin in ipairs(userData.playerSkins) do
+      if skin.id ~= skinId then
+        table.insert(newSkins, skin)
+      else
+        deleted = true
+      end
+    end
+
+    userData.playerSkins = newSkins
+
+    -- If we deleted the active skin, reset to first available
+    if userData.activeSkin == skinId then
+      if #newSkins > 0 then
+        userData.activeSkin = newSkins[1].id
+        if newSkins[1].skinData then
+          local ok, parsedSkin = pcall(cjson.decode, newSkins[1].skinData)
+          if ok then
+            userData.skin = parsedSkin
+          end
+        end
+      else
+        userData.activeSkin = nil
+      end
+    end
+
+    -- Save back
+    local result = cjson.encode(userData)
+    redis.call('SET', KEYS[1], result)
+
+    return cjson.encode({deleted = deleted, playerSkins = userData.playerSkins, activeSkin = userData.activeSkin})
+  `;
+
+  try {
+    const result = await redis.eval(luaScript, 1, key, skinId);
+    const parsed = JSON.parse(result);
+    console.log('atomicDeletePlayerSkin: deleted skin', skinId, 'for', uuid, 'success:', parsed.deleted);
+    return parsed;
+  } catch (e) {
+    console.error('atomicDeletePlayerSkin failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Get player skins data (read-only, safe for any worker)
+ */
+async function getPlayerSkins(uuid) {
+  if (!isConnected()) return { playerSkins: [], activeSkin: null };
+
+  try {
+    const data = await redis.get(`${KEYS.USER}${uuid}`);
+    if (!data) return { playerSkins: [], activeSkin: null };
+
+    const userData = JSON.parse(data);
+    return {
+      playerSkins: userData.playerSkins || [],
+      activeSkin: userData.activeSkin || null
+    };
+  } catch (e) {
+    console.error('getPlayerSkins failed:', e.message);
+    return { playerSkins: [], activeSkin: null };
+  }
+}
+
 /**
  * Atomically update skin data using Lua script
  * This prevents race conditions when multiple workers handle concurrent skin updates
@@ -1870,6 +2165,13 @@ module.exports = {
   getUsername,
   getCachedUsername,
   setCachedUsername,
+
+  // Player skins (atomic operations)
+  getPlayerSkins,
+  atomicAddPlayerSkin,
+  atomicUpdatePlayerSkin,
+  atomicSetActiveSkin,
+  atomicDeletePlayerSkin,
 
   // Admin stats (optimized)
   isRedisConnected,

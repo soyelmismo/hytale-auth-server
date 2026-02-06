@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const storage = require('../services/storage');
 const assets = require('../services/assets');
 const { sendJson, sendNoContent } = require('../utils/response');
@@ -214,6 +215,144 @@ function handleGetProfiles(req, res, body, uuid, name) {
 }
 
 /**
+ * Player skins GET endpoint - returns list of player's saved avatar profiles
+ * Used by pre-release multi-avatar feature
+ */
+async function handlePlayerSkinsGet(req, res, body, uuid, name) {
+  console.log('player-skins GET:', uuid, name);
+
+  // Use atomic read to get consistent data
+  const { playerSkins, activeSkin: storedActiveSkin } = await storage.getPlayerSkins(uuid);
+
+  // Get active skin - default to first skin if not set
+  let activeSkin = storedActiveSkin;
+  if (!activeSkin && playerSkins.length > 0) {
+    activeSkin = playerSkins[0].id;
+  }
+
+  console.log('player-skins GET: returning', playerSkins.length, 'skins, activeSkin:', activeSkin);
+
+  // F2P: Allow up to 10 avatar profiles (more generous than official 5)
+  sendJson(res, 200, {
+    activeSkin: activeSkin || null,
+    maxSkins: 10,
+    skins: playerSkins
+  });
+}
+
+/**
+ * Player skins POST endpoint - creates a new avatar profile
+ * Returns NewPlayerSkinResponse with skinId
+ */
+async function handlePlayerSkinsPost(req, res, body, uuid, name, invalidateHeadCache) {
+  console.log('player-skins POST:', uuid, body.name || name, 'body keys:', Object.keys(body || {}).join(', '));
+
+  // Generate a new unique skin ID
+  const skinId = crypto.randomUUID();
+
+  // Extract skin data and name from request
+  const skinName = body.name || 'Default Avatar';
+  const skinData = body.skinData || '';
+
+  // Create new skin object
+  const newSkin = {
+    id: skinId,
+    name: skinName,
+    skinData: skinData,
+    createdAt: new Date().toISOString()
+  };
+
+  // Use atomic operation to add skin (prevents race conditions)
+  const result = await storage.atomicAddPlayerSkin(uuid, newSkin);
+
+  if (!result) {
+    console.error('player-skins POST: failed to add skin for', uuid);
+    sendJson(res, 500, { error: 'Failed to create skin' });
+    return;
+  }
+
+  // Invalidate head cache since skin changed
+  if (invalidateHeadCache) {
+    invalidateHeadCache(uuid);
+  }
+
+  console.log('player-skins POST: created new skin for', uuid, 'skinId:', skinId, 'name:', skinName, 'total:', result.playerSkins?.length);
+
+  // Return 201 Created with skinId (matches official Hytale API)
+  sendJson(res, 201, {
+    skinId: skinId
+  });
+}
+
+/**
+ * Player skins PUT /active endpoint - select active skin
+ * Request body: { skinId: "uuid" }
+ */
+async function handlePlayerSkinsSetActive(req, res, body, uuid) {
+  const skinId = body.skinId;
+  console.log('player-skins PUT active:', uuid, 'skinId:', skinId);
+
+  // Use atomic operation to set active skin (prevents race conditions)
+  const result = await storage.atomicSetActiveSkin(uuid, skinId);
+
+  if (!result) {
+    console.error('player-skins PUT active: failed to set active skin for', uuid);
+  }
+
+  sendNoContent(res);
+}
+
+/**
+ * Player skins PUT /{skinId} endpoint - update a specific skin
+ */
+async function handlePlayerSkinsUpdate(req, res, body, uuid, skinId, invalidateHeadCache) {
+  console.log('player-skins PUT update:', uuid, 'skinId:', skinId, 'body keys:', Object.keys(body || {}).join(', '));
+
+  // Build updates object
+  const updates = {};
+  if (body.name !== undefined) updates.name = body.name;
+  if (body.skinData !== undefined) updates.skinData = body.skinData;
+
+  // Use atomic operation to update skin (prevents race conditions)
+  const result = await storage.atomicUpdatePlayerSkin(uuid, skinId, updates);
+
+  if (!result) {
+    console.error('player-skins PUT update: failed to update skin for', uuid);
+  }
+
+  // Invalidate head cache since skin changed
+  if (invalidateHeadCache) {
+    invalidateHeadCache(uuid);
+  }
+
+  sendNoContent(res);
+}
+
+/**
+ * Player skins DELETE /{skinId} endpoint - delete a specific skin
+ * Returns 204 No Content
+ */
+async function handlePlayerSkinsDelete(req, res, uuid, skinId, invalidateHeadCache) {
+  console.log('player-skins DELETE:', uuid, 'skinId:', skinId);
+
+  // Use atomic operation to delete skin (prevents race conditions)
+  const result = await storage.atomicDeletePlayerSkin(uuid, skinId);
+
+  if (result?.deleted) {
+    console.log('player-skins DELETE: removed skin', skinId, 'for', uuid);
+
+    // Invalidate head cache since skin changed
+    if (invalidateHeadCache) {
+      invalidateHeadCache(uuid);
+    }
+  } else {
+    console.log('player-skins DELETE: skin not found', skinId, 'for', uuid);
+  }
+
+  sendNoContent(res);
+}
+
+/**
  * Cosmetics endpoint
  */
 function handleCosmetics(req, res, body, uuid, name) {
@@ -235,6 +374,11 @@ module.exports = {
   handleProfileLookupByUsername,
   handleGameProfile,
   handleSkin,
+  handlePlayerSkinsGet,
+  handlePlayerSkinsPost,
+  handlePlayerSkinsSetActive,
+  handlePlayerSkinsUpdate,
+  handlePlayerSkinsDelete,
   handleLauncherData,
   handleGetProfiles,
   handleCosmetics,
