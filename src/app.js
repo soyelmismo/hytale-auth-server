@@ -88,7 +88,7 @@ async function routeRequest(req, res, url, urlPath, body, uuid, name, tokenScope
   // Debug SSR routes (before other routes to avoid catch-all)
   if (urlPath.startsWith('/debug/')) {
     console.log('[DEBUG ROUTE] Matched /debug/', urlPath);
-    const handled = await routes.debug.handleDebugRoutes(req, res, urlPath);
+    const handled = await routes.debug.handleDebugRoutes(req, res, urlPath, body);
     console.log('[DEBUG ROUTE] Handled:', handled);
     if (handled) return;
   }
@@ -251,6 +251,36 @@ async function routeRequest(req, res, url, urlPath, body, uuid, name, tokenScope
 
   if (urlPath === '/my-account/cosmetics' || urlPath.includes('/my-account/cosmetics')) {
     routes.account.handleCosmetics(req, res, body, uuid, name);
+    return;
+  }
+
+  // Player skins endpoints (pre-release multi-avatar feature)
+  if (urlPath === '/player-skins') {
+    if (req.method === 'POST') {
+      await routes.account.handlePlayerSkinsPost(req, res, body, uuid, name, routes.avatar.invalidateHeadCache);
+    } else {
+      await routes.account.handlePlayerSkinsGet(req, res, body, uuid, name);
+    }
+    return;
+  }
+
+  // Set active skin: PUT /player-skins/active
+  if (urlPath === '/player-skins/active' && req.method === 'PUT') {
+    await routes.account.handlePlayerSkinsSetActive(req, res, body, uuid);
+    return;
+  }
+
+  // Update specific skin: PUT /player-skins/{skinId}
+  if (urlPath.startsWith('/player-skins/') && req.method === 'PUT') {
+    const skinId = urlPath.replace('/player-skins/', '');
+    await routes.account.handlePlayerSkinsUpdate(req, res, body, uuid, skinId, routes.avatar.invalidateHeadCache);
+    return;
+  }
+
+  // Delete specific skin: DELETE /player-skins/{skinId}
+  if (urlPath.startsWith('/player-skins/') && req.method === 'DELETE') {
+    const skinId = urlPath.replace('/player-skins/', '');
+    await routes.account.handlePlayerSkinsDelete(req, res, uuid, skinId, routes.avatar.invalidateHeadCache);
     return;
   }
 
@@ -485,7 +515,9 @@ async function routeRequest(req, res, url, urlPath, body, uuid, name, tokenScope
   }
 
   // Catch-all - return comprehensive response that might satisfy various requests
-  console.log(`Unknown endpoint: ${urlPath}`);
+  // Log unknown endpoints with full details for debugging new game features
+  const bodyKeys = body && typeof body === 'object' ? Object.keys(body).join(', ') : 'none';
+  console.log(`Unknown endpoint: ${req.method} ${urlPath} | body keys: [${bodyKeys}] | uuid: ${uuid} | name: ${name}`);
   const requestHost = req.headers.host;
   const authGrant = auth.generateAuthorizationGrant(uuid, name, crypto.randomUUID(), null, requestHost);
   const accessToken = auth.generateIdentityToken(uuid, name, null, ['game.base'], requestHost);
