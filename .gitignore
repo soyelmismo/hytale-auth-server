@@ -27,7 +27,16 @@ legacy/
 
 # Patching dependencies
 patcher/lib/
-patcher/*.jar
-patcher/*.class
+*.class
 *.txt
 *.diff
+.gradle
+build/
+dualauth-agent/build.ps1
+dualauth-agent/useful-data-structures
+ref/
+
+# Useless dirs
+.playwright-mcp
+.agent
+dualauth-agent/start-server.sh

@@ -3,12 +3,12 @@ name: Test DualAuth Patcher
 on:
   push:
     paths:
-      - 'patcher/**'
+      - 'dualauth-agent/**'
       - '.github/workflows/test-patcher.yml'
       - '.github/scripts/**'
   pull_request:
     paths:
-      - 'patcher/**'
+      - 'dualauth-agent/**'
       - '.github/scripts/**'
   workflow_dispatch:
     inputs:
@@ -32,10 +32,12 @@ env:
   HYTALE_AUTH_URL: 'https://auth.sanasol.ws'
 
 jobs:
-  test-patcher:
-    name: Test Patcher Compilation & Patching
+  build-agent:
+    name: Build DualAuth Agent & Download Server
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -46,72 +48,46 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
+          cache: 'gradle'
 
-      - name: Download ASM Libraries
-        working-directory: patcher
+      - name: Build Agent
+        working-directory: dualauth-agent
         run: |
-          mkdir -p lib
-          cd lib
-          echo "Downloading ASM 9.6 libraries..."
-          curl -sfLO https://repo1.maven.org/maven2/org/ow2/asm/asm/9.6/asm-9.6.jar
-          curl -sfLO https://repo1.maven.org/maven2/org/ow2/asm/asm-tree/9.6/asm-tree-9.6.jar
-          curl -sfLO https://repo1.maven.org/maven2/org/ow2/asm/asm-util/9.6/asm-util-9.6.jar
-          ls -la
+          chmod +x ./gradlew
+          ./gradlew clean shadowJar --stacktrace --info
+          ls -la build/libs/*.jar
 
-      - name: Compile Patcher
-        working-directory: patcher
+      - name: Extract version
+        id: get_version
+        working-directory: dualauth-agent
         run: |
-          echo "Compiling DualAuthPatcher..."
-          javac -cp "lib/*" DualAuthPatcher.java
-          ls -la *.class
+          VERSION=$(grep "version =" build.gradle | cut -d"'" -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
 
       - name: Download Original Server JAR
-        working-directory: patcher
         run: |
           echo "Downloading server JAR from: $SERVER_JAR_URL"
           curl -sfL "$SERVER_JAR_URL" -o HytaleServerOriginal.jar
           ls -lh HytaleServerOriginal.jar
 
-          # Verify it's not already patched
-          if unzip -l HytaleServerOriginal.jar | grep -q "DualAuthContext.class"; then
-            echo "::warning::Downloaded JAR appears to already be patched"
-          fi
-
-      - name: Run Patcher
-        working-directory: patcher
-        run: |
-          echo "Running DualAuthPatcher..."
-          java -cp ".:lib/*" DualAuthPatcher HytaleServerOriginal.jar HytaleServerPatched.jar
-
-          echo ""
-          echo "=== Verifying Patched JAR ==="
-
-          # Check for injected classes
-          echo "Checking for DualAuth classes..."
-          DUAL_CLASSES=$(unzip -l HytaleServerPatched.jar | grep -c "DualAuth\|DualJwks\|DualServer" || echo "0")
-          echo "DualAuth classes found: $DUAL_CLASSES"
-
-          if [ "$DUAL_CLASSES" -lt 5 ]; then
-            echo "::error::Patching failed - expected at least 5 DualAuth classes"
-            exit 1
-          fi
-
-          # List injected classes
-          unzip -l HytaleServerPatched.jar | grep -E "DualAuth|DualJwks|DualServer"
-
-          echo ""
-          echo "Patching successful!"
-
-      - name: Upload Patched JAR
+      - name: Upload Agent Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: patched-server-jar
-          path: patcher/HytaleServerPatched.jar
+          name: dualauth-agent
+          path: dualauth-agent/build/libs/dualauth-agent.jar
+          retention-days: 7
+
+      - name: Upload Server JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-jar
+          path: HytaleServerOriginal.jar
           retention-days: 7
 
   test-server-boot:
     name: Test Server Boot
-    needs: test-patcher
+    needs: build-agent
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: ${{ !inputs.skip_boot_test }}
@@ -120,17 +96,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
+      - name: Setup Java 25
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '21'
+          java-version: '25'
 
-      - name: Download Patched JAR
+      - name: Download Agent & Server
         uses: actions/download-artifact@v4
         with:
-          name: patched-server-jar
           path: server
+          merge-multiple: true
 
       - name: Cache Assets.zip
         id: cache-assets
@@ -170,7 +146,7 @@ jobs:
           echo "Testing for bytecode patching errors (NoSuchFieldError, etc.)"
           echo ""
 
-          java -Xmx2G -jar HytaleServerPatched.jar \
+          java -Xmx2G -javaagent:dualauth-agent.jar -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bare \
             --disable-sentry \
@@ -236,7 +212,7 @@ jobs:
           kill $SERVER_PID 2>/dev/null || true
           sleep 1
           kill -9 $SERVER_PID 2>/dev/null || true
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
 
           echo ""
           echo "=== Server Log (last 20 lines) ==="
@@ -269,7 +245,7 @@ jobs:
 
   test-mock-client:
     name: Test Mock Client Connection
-    needs: test-patcher
+    needs: build-agent
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: ${{ !inputs.skip_boot_test }}
@@ -278,11 +254,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
+      - name: Setup Java 25
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '21'
+          java-version: '25'
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -293,11 +269,11 @@ jobs:
         run: |
           pip install aioquic cryptography
 
-      - name: Download Patched JAR
+      - name: Download Agent & Server
         uses: actions/download-artifact@v4
         with:
-          name: patched-server-jar
           path: server
+          merge-multiple: true
 
       - name: Cache Assets.zip
         id: cache-assets
@@ -380,7 +356,8 @@ jobs:
 
           echo "Starting Hytale server..."
           java -Xmx2G \
-            -jar HytaleServerPatched.jar \
+            -javaagent:dualauth-agent.jar \
+            -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bind 0.0.0.0:5520 \
             --universe universe_ci \
@@ -657,7 +634,7 @@ jobs:
             sleep 1
             kill -9 $(cat server/server.pid) 2>/dev/null || true
           fi
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
           sleep 2
 
       # ==========================================
@@ -676,7 +653,8 @@ jobs:
           echo "IMPORTANT: Testing WITH CLI tokens to verify server can validate its own identity"
           HYTALE_TRUST_ALL_ISSUERS=false \
           java -Xmx2G \
-            -jar HytaleServerPatched.jar \
+            -javaagent:dualauth-agent.jar \
+            -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bind 0.0.0.0:5522 \
             --universe universe_strict \
@@ -788,7 +766,7 @@ jobs:
             sleep 1
             kill -9 $(cat server/server_strict.pid) 2>/dev/null || true
           fi
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
           sleep 2
 
       # ==========================================
@@ -808,7 +786,8 @@ jobs:
           echo "Expected: Server boots fine, but Omni-Auth players should be REJECTED"
           HYTALE_TRUST_ALL_ISSUERS=false \
           java -Xmx2G \
-            -jar HytaleServerPatched.jar \
+            -javaagent:dualauth-agent.jar \
+            -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bind 0.0.0.0:5524 \
             --universe universe_strict_pure \
@@ -914,7 +893,7 @@ jobs:
             sleep 1
             kill -9 $(cat server/server_strict_pure.pid) 2>/dev/null || true
           fi
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
           sleep 2
 
       - name: Start Server (strict mode - with trusted issuer allowlist)
@@ -930,7 +909,8 @@ jobs:
           HYTALE_TRUST_ALL_ISSUERS=false \
           HYTALE_TRUSTED_ISSUERS="127.0.0.1,localhost" \
           java -Xmx2G \
-            -jar HytaleServerPatched.jar \
+            -javaagent:dualauth-agent.jar \
+            -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bind 0.0.0.0:5523 \
             --universe universe_trusted \
@@ -1121,7 +1101,7 @@ jobs:
             sleep 1
             kill -9 $(cat server/server_trusted.pid) 2>/dev/null || true
           fi
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
           sleep 2
 
       - name: Start Server (no-tokens mode)
@@ -1134,7 +1114,8 @@ jobs:
 
           echo "Starting Hytale server WITHOUT tokens (no-tokens mode)..."
           java -Xmx2G \
-            -jar HytaleServerPatched.jar \
+            -javaagent:dualauth-agent.jar \
+            -jar HytaleServerOriginal.jar \
             --assets Assets.zip \
             --bind 0.0.0.0:5521 \
             --universe universe_no_tokens \
@@ -1270,7 +1251,7 @@ jobs:
             kill $(cat server/server_no_tokens.pid) 2>/dev/null || true
             kill -9 $(cat server/server_no_tokens.pid) 2>/dev/null || true
           fi
-          pkill -9 -f HytaleServerPatched.jar 2>/dev/null || true
+          pkill -9 -f HytaleServerOriginal.jar 2>/dev/null || true
 
       - name: Upload Logs
         if: always()
@@ -1283,3 +1264,63 @@ jobs:
             server/server_trusted.log
             server/server_no_tokens.log
           retention-days: 7
+
+  release:
+    name: Deploy Release
+    needs: [build-agent, test-server-boot, test-mock-client]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Agent Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dualauth-agent
+          path: ./
+          merge-multiple: true
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          # Get commits for dualauth-agent since last tag or all if no tags
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            # No tags found, using all commits for the folder
+            LOG=$(git log --oneline -- dualauth-agent/)
+          else
+            # Get changes since last tag that affected the folder
+            LOG=$(git log ${LAST_TAG}..HEAD --oneline -- dualauth-agent/)
+          fi
+          
+          # Clean up log and escape for GH output
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          if [ -z "$LOG" ]; then
+            echo "No specific changes in dualauth-agent/ since last release." >> $GITHUB_OUTPUT
+          else
+            echo "$LOG" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build-agent.outputs.version }}
+          name: DualAuth Agent v${{ needs.build-agent.outputs.version }}
+          body: |
+            ## DualAuth Agent Release
+            
+            This release contains the latest `dualauth-agent.jar` built automatically by CI.
+            
+            ### Changes in dualauth-agent/:
+            ${{ steps.changelog.outputs.CHANGELOG }}
+          files: dualauth-agent.jar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
