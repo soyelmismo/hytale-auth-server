@@ -47,8 +47,11 @@ public class EmbeddedJwkVerifier {
             Map<String, Object> headerMap = JSONObjectUtils.parse(headerStr);
             if (!headerMap.containsKey("jwk")) return null;
 
-            // Extract JWK from header map
-            JWK jwk = JWK.parse((Map<String, Object>) headerMap.get("jwk"));
+            // Extract JWK from header map as a Map first to preserve raw data
+            Map<String, Object> jwkMap = (Map<String, Object>) headerMap.get("jwk");
+            
+            // Parse to object for verification logic
+            JWK jwk = JWK.parse(jwkMap);
             if (!(jwk instanceof OctetKeyPair)) return null;
             OctetKeyPair kp = (OctetKeyPair) jwk;
 
@@ -79,7 +82,13 @@ public class EmbeddedJwkVerifier {
             // MISSION CRITICAL: Populate context
             DualAuthContext.setIssuer(issuer);
             DualAuthContext.setPlayerUuid(claims.getSubject());
-            DualAuthContext.setJwk(kp.toJSONString());
+            
+            // FIX: Serialize the Map directly to JSON string.
+            // This bypasses OctetKeyPair.toJSONString() which strips private keys,
+            // and bypasses the brittle extractRawJwk string manipulation.
+            String rawJwkJson = JSONObjectUtils.toJSONString(jwkMap);
+            DualAuthContext.setJwk(rawJwkJson);
+            
             DualAuthContext.setOmni(true);
             
             // Capture username from claims if present
@@ -99,6 +108,7 @@ public class EmbeddedJwkVerifier {
         }
     }
 
+    
     public static String createSignedToken(String issuer, String tokenType) {
         if (Boolean.getBoolean("dualauth.debug")) {
             LOGGER.info("DEBUG: createSignedToken called with issuer: " + issuer);
@@ -108,10 +118,16 @@ public class EmbeddedJwkVerifier {
         try {
             String jwkJson = DualAuthContext.getJwk();
             if (jwkJson == null) return null;
+            // Parse the JWK string back to an object. Since we saved the raw map with 'd',
+            // this parsed object will now represent a Private Key.
             OctetKeyPair kp = OctetKeyPair.parse(jwkJson);
             
             if (!kp.isPrivate()) {
                 LOGGER.info("Cannot sign Omni-Auth token: Private key 'd' missing in captured JWK");
+                if (Boolean.getBoolean("dualauth.debug")) {
+                    // Safety check: Don't log full key in production, but helpful for debugging why 'd' is missing
+                    LOGGER.info("DEBUG: Captured JWK content (redacted): " + jwkJson.replaceAll("\"d\":\\s*\"[^\"]+\"", "\"d\":\"REDACTED\""));
+                }
                 return null;
             }
 
@@ -167,6 +183,7 @@ public class EmbeddedJwkVerifier {
             return token;
         } catch (Exception e) {
             LOGGER.info("Token Sign Failure: " + e.getMessage());
+            e.printStackTrace();
             return null;
         }
     }
