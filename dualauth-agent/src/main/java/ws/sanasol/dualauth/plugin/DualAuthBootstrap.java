@@ -1,4 +1,4 @@
-package com.hytale.dualauth.plugin;
+package ws.sanasol.dualauth.plugin;
 
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
@@ -61,7 +61,7 @@ public class DualAuthBootstrap extends JavaPlugin {
             // Si usáramos DualAuthAgent.class directamente, usaríamos el PluginClassLoader, causando LinkageError.
             ClassLoader systemLoader = ClassLoader.getSystemClassLoader();
             
-            Class<?> agentClass = systemLoader.loadClass("com.hytale.dualauth.agent.DualAuthAgent");
+            Class<?> agentClass = systemLoader.loadClass("ws.sanasol.dualauth.agent.DualAuthAgent");
             Method agentMainMethod = agentClass.getMethod("agentmain", String.class, Instrumentation.class);
             
             // 5. Ejecutar el agente en el contexto del Sistema

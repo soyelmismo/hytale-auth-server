@@ -1,7 +1,7 @@
-package com.hytale.dualauth.embedded;
+package ws.sanasol.dualauth.embedded;
 
-import com.hytale.dualauth.context.DualAuthContext;
-import com.hytale.dualauth.context.DualAuthHelper;
+import ws.sanasol.dualauth.context.DualAuthContext;
+import ws.sanasol.dualauth.context.DualAuthHelper;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.crypto.Ed25519Signer;

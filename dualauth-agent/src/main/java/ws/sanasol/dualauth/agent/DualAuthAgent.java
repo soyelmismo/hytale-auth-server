@@ -1,7 +1,7 @@
-package com.hytale.dualauth.agent;
+package ws.sanasol.dualauth.agent;
 
-import com.hytale.dualauth.agent.transformers.*;
-import com.hytale.dualauth.agent.transformers.LoggingTransformer;
+import ws.sanasol.dualauth.agent.transformers.*;
+import ws.sanasol.dualauth.agent.transformers.LoggingTransformer;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
@@ -135,7 +135,7 @@ public class DualAuthAgent {
                .or(ElementMatchers.nameStartsWith("jdk."))
                .or(ElementMatchers.nameStartsWith("java."))
                .or(ElementMatchers.nameStartsWith("sun."))
-               .or(ElementMatchers.nameStartsWith("com.hytale.dualauth.")))
+               .or(ElementMatchers.nameStartsWith("ws.sanasol.dualauth.")))
             
             // 1. JWT Logic
             .type(named("com.hypixel.hytale.server.core.auth.JWTValidator"))

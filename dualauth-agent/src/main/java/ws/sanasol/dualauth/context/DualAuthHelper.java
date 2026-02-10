@@ -1,8 +1,8 @@
-package com.hytale.dualauth.context;
+package ws.sanasol.dualauth.context;
 
-import com.hytale.dualauth.agent.DualAuthConfig;
-import com.hytale.dualauth.server.DualServerTokenManager;
-import com.hytale.dualauth.embedded.EmbeddedJwkVerifier;
+import ws.sanasol.dualauth.agent.DualAuthConfig;
+import ws.sanasol.dualauth.server.DualServerTokenManager;
+import ws.sanasol.dualauth.embedded.EmbeddedJwkVerifier;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;

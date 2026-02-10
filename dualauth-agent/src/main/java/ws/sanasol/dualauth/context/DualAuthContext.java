@@ -1,4 +1,4 @@
-package com.hytale.dualauth.context;
+package ws.sanasol.dualauth.context;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -146,7 +146,7 @@ public class DualAuthContext {
         if (issuer == null) return false;
         
         // Check against F2P domain from config
-        String f2pBase = com.hytale.dualauth.agent.DualAuthConfig.F2P_BASE_DOMAIN;
+        String f2pBase = ws.sanasol.dualauth.agent.DualAuthConfig.F2P_BASE_DOMAIN;
         return f2pBase != null && issuer.contains(f2pBase);
     }
 }
