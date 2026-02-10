@@ -32,9 +32,15 @@ public class SessionServiceClientTransformer implements net.bytebuddy.agent.buil
             ))
             .visit(Advice.to(ConstructorUrlPatch.class).on(isConstructor()))
             .visit(Advice.to(UrlRoutingAdvice.class).on(
-                named("requestAuthorizationGrantAsync").or(named("refreshSessionAsync")).or(named("validateSessionAsync"))
+                named("requestAuthorizationGrantAsync")
+                .or(named("refreshSessionAsync"))
+                .or(named("validateSessionAsync"))
+                .or(named("exchangeAuthGrantForTokenAsync")) // Added for F2P/Omni
             ))
-            .visit(Advice.to(OfflineBypassAdvice.class).on(named("requestAuthorizationGrantAsync")))
+            .visit(Advice.to(OfflineBypassAdvice.class).on(
+                named("requestAuthorizationGrantAsync")
+                .or(named("exchangeAuthGrantForTokenAsync")) // Added for Omni Bypass
+            ))
             .visit(Advice.to(LambdaContextAdvice.class).on(
                 nameContains("lambda$").and(takesArguments(String.class).or(takesArguments(String.class, String.class)))
             ));
@@ -118,10 +124,17 @@ public class SessionServiceClientTransformer implements net.bytebuddy.agent.buil
 
     public static class OfflineBypassAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
-        public static CompletableFuture<String> enter(@Advice.Argument(0) String identityToken) {
+        public static CompletableFuture<String> enter(@Advice.Argument(0) String tokenArg) {
             try {
-                if (DualAuthContext.isOmni() || DualAuthHelper.hasEmbeddedJwk(identityToken)) {
-                    return CompletableFuture.completedFuture(identityToken);
+                // If Omni-Auth is active OR the provided token itself is self-signed (has embedded JWK),
+                // we bypass the external HTTP call and immediately return the token as valid.
+                // This applies to both requestAuthorizationGrantAsync (identityToken -> grant)
+                // and exchangeAuthGrantForTokenAsync (grant -> accessToken).
+                if (DualAuthContext.isOmni() || DualAuthHelper.hasEmbeddedJwk(tokenArg)) {
+                    if (Boolean.getBoolean("dualauth.debug")) {
+                        System.out.println("[DualAuthAgent] OfflineBypass: Bypassing session call for Omni/Embedded token.");
+                    }
+                    return CompletableFuture.completedFuture(tokenArg);
                 }
             } catch (Exception ignored) {}
             return null;
