@@ -166,15 +166,15 @@ public class DualAuthAgent {
         System.out.println("DualAuth Hybrid Agent installed successfully.");
         System.out.println("Waiting for Hytale Server classes to load...");
 
-        // 3. EL "MARTILLO": Forzar retransformación si estamos en modo Plugin
-        // Si el servidor ya arrancó, las clases ya están cargadas y ByteBuddy a veces las ignora.
-        // Aquí las buscamos y obligamos a la JVM a re-procesarlas.
+        // 3. THE "HAMMER": Force retransformation if we are in Plugin mode
+        // If the server already started, classes are already loaded and ByteBuddy sometimes ignores them.
+        // Here we search for them and force the JVM to re-process them.
         boolean isPluginMode = args != null && args.contains("plugin-mode");
         if (isPluginMode) {
             System.out.println("[DualAuth] Dynamic Mode: Scanning for loaded classes to retransform...");
             long count = 0;
             
-            // Lista de clases críticas que sabemos que ya están cargadas
+            // List of critical classes we know are already loaded
             String[] criticalClasses = {
                 "com.hypixel.hytale.server.core.auth.JWTValidator",
                 "com.hypixel.hytale.server.core.auth.SessionServiceClient",
@@ -186,7 +186,7 @@ public class DualAuthAgent {
             for (Class<?> loadedClass : inst.getAllLoadedClasses()) {
                 String name = loadedClass.getName();
                 
-                // Verificar si es una de nuestras clases objetivo
+                // Check if it's one of our target classes
                 boolean target = false;
                 for (String critical : criticalClasses) {
                     if (name.equals(critical) || (critical.contains("HandshakeHandler") && name.contains("HandshakeHandler"))) {
@@ -197,7 +197,7 @@ public class DualAuthAgent {
 
                 if (target) {
                     try {
-                        // Esto dispara el transformer registrado arriba
+                        // This triggers the transformer registered above
                         inst.retransformClasses(loadedClass);
                         count++;
                     } catch (Throwable e) {

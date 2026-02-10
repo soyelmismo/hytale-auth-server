@@ -25,11 +25,12 @@ public class DualAuthBootstrap extends JavaPlugin {
 
     @Override
     protected void setup() {
-        // Verificar si el agente ya está corriendo (cargado al inicio con -javaagent)
+        // Check if the agent is already running (loaded at startup with -javaagent)
+        // This is not being triggered because HytaleServer detects the duplicated plugins before this even can prevent it
         if (System.getProperty("dualauth.agent.active") != null) {
             System.out.println("[DualAuth] Plugin Wrapper: Agent is ALREADY ACTIVE via -javaagent flag.");
             System.out.println("[DualAuth] Plugin Wrapper: Entering PASSIVE mode (no action taken).");
-            return; // EXITOSA, pero no hace nada.
+            return; // SUCCESSFUL, but does nothing.
         }
 
         System.out.println("[DualAuth] Plugin Wrapper: Agent not detected. Initializing Dynamic Attach...");
@@ -38,36 +39,36 @@ public class DualAuthBootstrap extends JavaPlugin {
 
     @Override
     protected void start() {
-        // Nada que hacer aquí. La lógica reside enteramente en el Agente (System ClassLoader).
+        // Nothing to do here. Logic resides entirely in the Agent (System ClassLoader).
     }
 
     private void injectAgent() {
         try {
-            // Doble verificación por seguridad
+            // Double verification for safety
             if (System.getProperty("dualauth.agent.active") != null) return;
 
-            // 1. Instalar ByteBuddy Agent para obtener Instrumentation
+            // 1. Install ByteBuddy Agent to get Instrumentation
             Instrumentation inst = ByteBuddyAgent.install();
 
-            // 2. Obtener la ubicación de ESTE archivo jar
+            // 2. Get the location of THIS jar file
             File currentJar = new File(getClass().getProtectionDomain().getCodeSource().getLocation().toURI());
 
-            // 3. INYECTAR EN SYSTEM CLASSLOADER
-            // Esto es vital. Movemos el JAR del "PluginClassLoader" al "SystemClassLoader".
+            // 3. INJECT INTO SYSTEM CLASSLOADER
+            // This is vital. We move the JAR from "PluginClassLoader" to "SystemClassLoader".
             inst.appendToSystemClassLoaderSearch(new JarFile(currentJar));
 
-            // 4. TRAMPOLÍN DE REFLEXIÓN
-            // Usamos el SystemClassLoader para cargar la clase del Agente.
-            // Si usáramos DualAuthAgent.class directamente, usaríamos el PluginClassLoader, causando LinkageError.
+            // 4. REFLECTION TRAMPOLINE
+            // We use the SystemClassLoader to load the Agent class.
+            // If we used DualAuthAgent.class directly, we would use the PluginClassLoader, causing LinkageError.
             ClassLoader systemLoader = ClassLoader.getSystemClassLoader();
             
             Class<?> agentClass = systemLoader.loadClass("ws.sanasol.dualauth.agent.DualAuthAgent");
             Method agentMainMethod = agentClass.getMethod("agentmain", String.class, Instrumentation.class);
             
-            // 5. Ejecutar el agente en el contexto del Sistema
+            // 5. Execute the agent in the System context
             agentMainMethod.invoke(null, "plugin-mode", inst);
             
-            // 6. Marcar éxito
+            // 6. Mark success
             System.setProperty("dualauth.agent.active", "true");
 
         } catch (Throwable e) {

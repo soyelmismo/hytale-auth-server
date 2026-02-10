@@ -121,7 +121,7 @@ public class DualAuthContext {
                 currentPlayerUuid.remove();
                 currentUsername.remove();
                 isCurrentTokenOmni.remove();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
                 // If even this fails, log but don't crash
                 LOGGER.warning("Critical error in context reset: " + e.getMessage());
             }
